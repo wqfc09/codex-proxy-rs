@@ -59,6 +59,7 @@ pub(crate) fn observability_page_offset(
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageRecordFilter {
+    pub user_id: Option<String>,
     pub client_api_key_ref: Option<String>,
     pub request_id: Option<String>,
     pub provider_account_ref: Option<String>,
@@ -77,6 +78,7 @@ pub struct UsageRecordFilter {
 impl UsageRecordFilter {
     pub fn validate(&self) -> StoreResult<()> {
         for (value, field) in [
+            (self.user_id.as_deref(), "user ID filter"),
             (self.client_api_key_ref.as_deref(), "client API key filter"),
             (self.request_id.as_deref(), "request ID filter"),
             (
@@ -122,6 +124,7 @@ pub struct UsageRecordQuery {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpsErrorFilter {
+    pub user_id: Option<String>,
     pub client_api_key_ref: Option<String>,
     pub request_id: Option<String>,
     pub provider_account_ref: Option<String>,
@@ -139,6 +142,7 @@ pub struct OpsErrorFilter {
 impl OpsErrorFilter {
     pub fn validate(&self) -> StoreResult<()> {
         for (value, field) in [
+            (self.user_id.as_deref(), "user ID filter"),
             (self.client_api_key_ref.as_deref(), "client API key filter"),
             (self.request_id.as_deref(), "request ID filter"),
             (
@@ -480,6 +484,8 @@ pub struct DashboardObservation {
 /// 使用记录列表所需的窄投影；完整执行、路由和客户端详情按 ID 单独读取。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageListRecord {
+    pub user_id: Option<String>,
+    pub username: Option<String>,
     pub client_api_key_name: Option<String>,
     pub billing_snapshot_json: Option<serde_json::Value>,
     pub id: String,
@@ -533,6 +539,8 @@ pub struct UsageListRecord {
 pub struct UsageRecord {
     pub billing_snapshot_json: Option<serde_json::Value>,
     pub id: String,
+    pub user_id: Option<String>,
+    pub username: Option<String>,
     pub client_api_key_ref: String,
     pub config_revision: u64,
     pub routing_scope: String,
@@ -656,6 +664,81 @@ pub struct UsageRecordDetail {
     pub related_requests: Vec<serde_json::Value>,
     pub request: UsageRecord,
     pub attempts: Vec<UsageAttemptObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserUsageRecord {
+    pub id: String,
+    pub client_api_key_ref: String,
+    pub client_api_key_name: String,
+    pub operation: String,
+    pub request_kind: Option<String>,
+    pub requested_model_id: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub image_input_tokens: Option<u64>,
+    pub image_output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub downstream_rate_multiplier: Option<DecimalAmount>,
+    pub downstream_billed_amount: Option<DecimalAmount>,
+    pub outcome: String,
+    pub client_status_code: Option<u16>,
+    pub latency_ms: Option<u64>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserUsageRecordPage {
+    pub items: Vec<UserUsageRecord>,
+    pub current_page: u32,
+    pub page_size: u16,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserUsageDailyPoint {
+    pub bucket_start: DateTime<Utc>,
+    pub request_count: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub total_tokens: u64,
+    pub billed_usd: Option<DecimalAmount>,
+    pub billed_known_count: u64,
+    pub billed_unknown_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserUsageBreakdown {
+    pub id: Option<String>,
+    pub name: String,
+    pub request_count: u64,
+    pub total_tokens: u64,
+    pub is_other: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserUsageSummary {
+    pub range: ObservabilityRange,
+    pub request_count: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub total_tokens: u64,
+    pub billed_usd: Option<DecimalAmount>,
+    pub billed_known_count: u64,
+    pub billed_unknown_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub average_latency_ms: Option<u64>,
+    pub trend_granularity: &'static str,
+    pub trend: Vec<UserUsageDailyPoint>,
+    pub daily: Vec<UserUsageDailyPoint>,
+    pub models: Vec<UserUsageBreakdown>,
+    pub client_keys: Vec<UserUsageBreakdown>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

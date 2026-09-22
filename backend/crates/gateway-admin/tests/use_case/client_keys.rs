@@ -27,6 +27,40 @@ struct TestClientKeyStore {
 
 #[async_trait]
 impl ClientKeyStore for TestClientKeyStore {
+    async fn reset_user_client_key_budget(
+        &self,
+        user_id: &str,
+        command: gateway_admin::model::client_keys::ResetClientKeyBudget,
+    ) -> AdminStoreResult<()> {
+        assert_eq!(user_id, "test_user");
+        self.reset_client_key_budget(command, &mutation_context())
+            .await
+    }
+    async fn list_user_client_keys(
+        &self,
+        user_id: &str,
+        query: ClientKeyListQuery,
+    ) -> AdminStoreResult<ClientKeyPage> {
+        assert_eq!(user_id, "test_user");
+        self.list_client_keys(query).await
+    }
+    async fn create_user_client_key(
+        &self,
+        user_id: &str,
+        key: NewClientKey,
+    ) -> AdminStoreResult<(Revision, ClientKeyRecord)> {
+        assert_eq!(user_id, "test_user");
+        self.create_client_key(key, &mutation_context()).await
+    }
+    async fn update_user_client_key(
+        &self,
+        user_id: &str,
+        key: UpdateClientKey,
+    ) -> AdminStoreResult<(Revision, ClientKeyRecord)> {
+        assert_eq!(user_id, "test_user");
+        self.update_client_key(key, &mutation_context()).await
+    }
+
     async fn reset_client_key_budget(
         &self,
         command: gateway_admin::model::client_keys::ResetClientKeyBudget,
@@ -138,7 +172,7 @@ async fn reset_budget_forwards_scope_and_returns_only_key_identity() {
     };
     let result = services
         .client_keys()
-        .reset_budget(&mutation_context(), command.clone())
+        .reset_budget_for_user("test_user", command.clone())
         .await
         .unwrap();
     assert_eq!(result, command.id);
@@ -157,16 +191,19 @@ async fn client_key_cursor_should_reject_value_that_does_not_match_sort() {
     };
     let error = services
         .client_keys()
-        .list(ClientKeyListQuery {
-            cursor: Some(ClientKeyCursor {
+        .list_for_user(
+            "test_user",
+            ClientKeyListQuery {
+                cursor: Some(ClientKeyCursor {
+                    sort,
+                    value: ClientKeyCursorValue::Enabled(true),
+                    id: ClientApiKeyId::new("key_cursor").expect("key ID"),
+                }),
+                page_size: ClientKeyPageSize::new(50).expect("page size"),
+                search: None,
                 sort,
-                value: ClientKeyCursorValue::Enabled(true),
-                id: ClientApiKeyId::new("key_cursor").expect("key ID"),
-            }),
-            page_size: ClientKeyPageSize::new(50).expect("page size"),
-            search: None,
-            sort,
-        })
+            },
+        )
         .await
         .expect_err("mismatched cursor must fail");
 
@@ -181,15 +218,18 @@ async fn client_key_list_should_forward_the_full_nonzero_u16_page_size() {
         .await;
     let page = services
         .client_keys()
-        .list(ClientKeyListQuery {
-            cursor: None,
-            page_size: ClientKeyPageSize::new(u16::MAX).expect("maximum page size"),
-            search: None,
-            sort: ClientKeySort {
-                field: ClientKeySortField::CreatedAt,
-                direction: SortDirection::Desc,
+        .list_for_user(
+            "test_user",
+            ClientKeyListQuery {
+                cursor: None,
+                page_size: ClientKeyPageSize::new(u16::MAX).expect("maximum page size"),
+                search: None,
+                sort: ClientKeySort {
+                    field: ClientKeySortField::CreatedAt,
+                    direction: SortDirection::Desc,
+                },
             },
-        })
+        )
         .await
         .expect("maximum page size should reach store");
 
@@ -206,7 +246,7 @@ async fn create_preserves_migrated_keys_and_keeps_default_generation() {
     for value in [Some("q".to_owned()), Some("legacy+/=:!".repeat(1024)), None] {
         let created = services
             .client_keys()
-            .create(&mutation_context(), create_command(value.as_deref()))
+            .create_for_user("test_user", create_command(value.as_deref()))
             .await
             .unwrap();
         let plaintext = created.secret.expose_for_response();
@@ -232,7 +272,7 @@ async fn duplicate_keys_return_actionable_conflicts_without_disclosing_the_key()
     let key = "legacy-duplicate-must-stay-private";
     let error = services
         .client_keys()
-        .create(&mutation_context(), create_command(Some(key)))
+        .create_for_user("test_user", create_command(Some(key)))
         .await
         .unwrap_err();
     assert_eq!(error.kind(), AdminErrorKind::Conflict);
@@ -252,13 +292,13 @@ async fn duplicate_names_report_the_same_actionable_conflict_on_create_and_updat
         .await;
     let created = services
         .client_keys()
-        .create(&mutation_context(), create_command(None))
+        .create_for_user("test_user", create_command(None))
         .await
         .unwrap_err();
     let updated = services
         .client_keys()
-        .update(
-            &mutation_context(),
+        .update_for_user(
+            "test_user",
             UpdateClientKey {
                 openai_client_profile_override: None,
                 xai_client_profile_override: None,

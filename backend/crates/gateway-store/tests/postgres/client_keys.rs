@@ -142,6 +142,7 @@ async fn duplicate_migrated_keys_conflict_atomically_without_extra_audits() {
 #[test]
 fn generated_client_key_format_remains_valid() {
     let key = NewClientApiKey {
+        owner_user_id: None,
         openai_client_profile_override: None,
         xai_client_profile_override: None,
         budget: Default::default(),
@@ -643,6 +644,7 @@ async fn dedicated_reveal_returns_plaintext_without_debug_exposure() {
 fn client_key_debug_redacts_plaintext() {
     let secret = format!("sk_{}", "s".repeat(43));
     let key = NewClientApiKey {
+        owner_user_id: None,
         openai_client_profile_override: None,
         xai_client_profile_override: None,
         budget: Default::default(),

@@ -23,25 +23,21 @@ fn password_change_request_rejects_unknown_fields_and_redacts_both_passwords() {
 fn login_request_should_deny_unknown_fields_and_redact_password_debug() {
     let password = "admin-password-must-not-leak";
     let request = serde_json::from_value::<LoginRequest>(json!({
-        "mode": "admin",
         "username": "admin@example.invalid",
         "password": password
     }))
     .expect("deserialize login request");
 
     assert!(!format!("{request:?}").contains(password));
-    let LoginCommand::Admin {
+    let LoginCommand {
         username,
         password: parsed_password,
-    } = request.into()
-    else {
-        panic!("admin login expected")
-    };
+    } = request.into();
     assert_eq!(username.as_deref(), Some("admin@example.invalid"));
     assert_eq!(parsed_password, password);
     assert!(
         serde_json::from_value::<LoginRequest>(json!({
-        "mode": "admin",
+            "username": "admin@example.invalid",
             "password": password,
             "rememberMe": true
         }))
@@ -55,7 +51,7 @@ async fn default_auth_service_should_initialize_login_validate_and_logout() {
     let service = fixture.services.auth();
     let session = service
         .login(
-            LoginCommand::Admin {
+            LoginCommand {
                 username: Some("admin_1".to_owned()),
                 password: "strong-admin-password".to_owned(),
             },
@@ -135,7 +131,7 @@ async fn audit_failure_should_revoke_new_session_before_returning_it() {
             .services
             .auth()
             .login(
-                LoginCommand::Admin {
+                LoginCommand {
                     username: None,
                     password: "strong-admin-password".to_owned(),
                 },

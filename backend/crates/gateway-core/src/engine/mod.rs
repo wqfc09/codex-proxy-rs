@@ -29,10 +29,10 @@ use crate::error::{
 use crate::event::ProviderEvent;
 use crate::identity::ProviderKind;
 use crate::lifecycle::CancellationToken;
-use crate::metering::{CostEstimate, Usage};
+use crate::metering::{CostEstimate, Decimal, Usage};
 use crate::operation::OperationKind;
 use crate::operation::ProviderSessionState;
-use crate::policy::ClientApiKeyId;
+use crate::policy::{ClientApiKeyId, SubscriptionId, UserId};
 use crate::routing::{ConfigRevision, PublicModelId, UpstreamModelId};
 use crate::upstream::UpstreamSendState;
 use crate::validation::{IdentifierError, validate_text};
@@ -598,6 +598,12 @@ pub struct NewModelRequest {
     pub id: ModelRequestId,
     pub client_api_key_id: Option<ClientApiKeyId>,
     pub client_api_key_ref: ClientApiKeyId,
+    pub user_id: Option<UserId>,
+    pub plan_id: Option<SubscriptionId>,
+    pub subscription_id: Option<SubscriptionId>,
+    pub downstream_rate_multiplier: Option<Decimal>,
+    pub username_snapshot: Option<String>,
+    pub client_api_key_name_snapshot: Option<String>,
     pub config_revision: ConfigRevision,
     pub routing: crate::routing::AccountRoutingSnapshot,
     pub protocol: String,

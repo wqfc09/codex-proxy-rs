@@ -5,6 +5,7 @@ mod health;
 mod key_usage;
 mod openai;
 mod support;
+mod user;
 
 #[tokio::test]
 async fn api_should_serve_resolved_assets_with_relative_environment_override() {

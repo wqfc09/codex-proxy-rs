@@ -228,6 +228,18 @@ fn rate_limited_error_should_map_to_openai_retryable_status() {
 }
 
 #[test]
+fn concurrency_limit_should_map_to_distinct_retryable_code() {
+    assert_eq!(
+        gateway_error_contract(GatewayErrorKind::ConcurrencyLimited),
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "concurrency_limit_exceeded",
+        ),
+    );
+}
+
+#[test]
 fn queue_rejections_keep_distinct_retryable_http_codes() {
     for (kind, code) in [
         (

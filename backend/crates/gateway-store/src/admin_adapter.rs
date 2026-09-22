@@ -1,9 +1,11 @@
 //! Admin 认证与设置 adapter。
 
 use super::*;
+use gateway_core::policy::UserRateLimits;
 
 pub(crate) struct AuthStoreAdapter {
     pub(crate) security: postgres::PgAdminSecurityAuditRepository,
+    pub(crate) identity: postgres::PgIdentityRepository,
     pub(crate) settings: postgres::PgRuntimeSettingsRepository,
     pub(crate) state: redis::RedisAuthStateRepository,
     pub(crate) keys: postgres::PgAdminClientKeyStore,
@@ -275,8 +277,10 @@ pub(crate) fn store_model_mappings(
 #[async_trait::async_trait]
 impl AuthStore for AuthStoreAdapter {
     async fn load_password_hash(&self, admin_user_id: &str) -> AdminStoreResult<Option<String>> {
-        postgres::AdminSecurityAuditRepository::password_hash(&self.security, admin_user_id)
+        self.identity
+            .user_by_id(admin_user_id)
             .await
+            .map(|user| user.map(|user| user.password_hash))
             .map_err(|error| admin_store_error("admin authentication", error))
     }
 
@@ -287,15 +291,15 @@ impl AuthStore for AuthStoreAdapter {
         password_hash: &str,
         audit: AdminAuditModel,
     ) -> AdminStoreResult<bool> {
-        postgres::AdminSecurityAuditRepository::change_password(
-            &self.security,
-            admin_user_id,
-            expected_hash,
-            password_hash,
-            auth_audit_record(audit)?,
-        )
-        .await
-        .map_err(|error| admin_store_error("administrator password", error))
+        self.identity
+            .change_password(
+                admin_user_id,
+                expected_hash,
+                password_hash,
+                auth_audit_record(audit)?,
+            )
+            .await
+            .map_err(|error| admin_store_error("administrator password", error))
     }
 
     async fn create_password_hash_if_absent(
@@ -303,13 +307,340 @@ impl AuthStore for AuthStoreAdapter {
         admin_user_id: &str,
         password_hash: &str,
     ) -> AdminStoreResult<bool> {
-        postgres::AdminSecurityAuditRepository::create_password_hash_if_absent(
-            &self.security,
-            admin_user_id,
-            password_hash,
-        )
-        .await
-        .map_err(|error| admin_store_error("admin authentication", error))
+        self.identity
+            .ensure_default_admin(admin_user_id, password_hash)
+            .await
+            .map_err(|error| admin_store_error("admin authentication", error))
+    }
+
+    async fn load_user_by_username(
+        &self,
+        username: &str,
+    ) -> AdminStoreResult<Option<gateway_admin::model::users::UserCredentialRecord>> {
+        self.identity
+            .user_by_username(username)
+            .await
+            .map_err(|error| admin_store_error("user identity", error))?
+            .map(identity_user_credential)
+            .transpose()
+    }
+
+    async fn load_user_by_id(
+        &self,
+        user_id: &str,
+    ) -> AdminStoreResult<Option<gateway_admin::model::users::UserCredentialRecord>> {
+        self.identity
+            .user_by_id(user_id)
+            .await
+            .map_err(|error| admin_store_error("user identity", error))?
+            .map(identity_user_credential)
+            .transpose()
+    }
+
+    async fn load_user_key_identity(
+        &self,
+        user_id: &str,
+    ) -> AdminStoreResult<gateway_admin::model::users::UserKeyIdentity> {
+        self.identity
+            .key_identity(user_id)
+            .await
+            .map_err(|error| admin_store_error("user key identity", error))
+    }
+
+    async fn replace_user_key_identity(
+        &self,
+        user_id: &str,
+        identity: gateway_admin::model::users::UserKeyIdentity,
+        context: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        let revision = self
+            .identity
+            .replace_key_identity(
+                user_id,
+                identity,
+                mutation_audit(
+                    context,
+                    "user.key_identity.update",
+                    "user",
+                    user_id,
+                    vec!["provider_request_profiles".to_owned()],
+                ),
+            )
+            .await
+            .map_err(|error| admin_store_error("user key identity", error))?;
+        admin_revision(revision)
+    }
+
+    async fn list_users(&self) -> AdminStoreResult<Vec<gateway_admin::model::users::UserRecord>> {
+        self.identity
+            .list_users()
+            .await
+            .map_err(|error| admin_store_error("user identity", error))?
+            .into_iter()
+            .map(identity_user_record)
+            .collect()
+    }
+
+    async fn create_user(
+        &self,
+        user: gateway_admin::model::users::UserCredentialRecord,
+        context: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::users::UserRecord> {
+        let stored = stored_user(&user);
+        self.identity
+            .create_user(
+                &stored,
+                mutation_audit(
+                    context,
+                    "user.create",
+                    "user",
+                    &stored.id,
+                    vec![
+                        "username".to_owned(),
+                        "role".to_owned(),
+                        "enabled".to_owned(),
+                    ],
+                ),
+            )
+            .await
+            .map_err(|error| admin_store_error("user identity", error))?;
+        Ok(user.user)
+    }
+
+    async fn update_user(
+        &self,
+        command: &gateway_admin::model::users::UpdateUser,
+        context: &MutationContext,
+    ) -> AdminStoreResult<(
+        gateway_admin::model::Revision,
+        gateway_admin::model::users::UserRecord,
+    )> {
+        let mut changed_fields = Vec::new();
+        if command.username.is_some() {
+            changed_fields.push("username".to_owned());
+        }
+        if command.role.is_some() {
+            changed_fields.push("role".to_owned());
+        }
+        if command.enabled.is_some() {
+            changed_fields.push("enabled".to_owned());
+        }
+        if command.max_concurrency.is_some() {
+            changed_fields.push("max_concurrency".to_owned());
+        }
+        if command.requests_per_minute.is_some() {
+            changed_fields.push("requests_per_minute".to_owned());
+        }
+        let (revision, stored) = self
+            .identity
+            .update_user(
+                postgres::StoredUserUpdate {
+                    id: &command.user_id,
+                    username: command.username.as_deref(),
+                    role: command
+                        .role
+                        .map(gateway_admin::model::users::UserRole::as_str),
+                    enabled: command.enabled,
+                    max_concurrency: command.max_concurrency,
+                    requests_per_minute: command.requests_per_minute,
+                },
+                mutation_audit(
+                    context,
+                    "user.update",
+                    "user",
+                    &command.user_id,
+                    changed_fields,
+                ),
+            )
+            .await
+            .map_err(|error| admin_store_error("user identity", error))?;
+        Ok((admin_revision(revision)?, identity_user_record(stored)?))
+    }
+
+    async fn update_user_username(
+        &self,
+        user_id: &str,
+        username: &str,
+        expected_session_version: u64,
+    ) -> AdminStoreResult<Option<gateway_admin::model::users::UserRecord>> {
+        self.identity
+            .update_username(user_id, username, expected_session_version)
+            .await
+            .map_err(|error| admin_store_error("user identity", error))?
+            .map(identity_user_record)
+            .transpose()
+    }
+
+    async fn update_user_password_hash_if_matches(
+        &self,
+        user_id: &str,
+        expected_hash: &str,
+        password_hash: &str,
+    ) -> AdminStoreResult<bool> {
+        self.identity
+            .update_password_hash_if_matches(user_id, expected_hash, password_hash)
+            .await
+            .map_err(|error| admin_store_error("user password", error))
+    }
+
+    async fn reset_user_password_hash(
+        &self,
+        user_id: &str,
+        password_hash: &str,
+        context: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::users::UserRecord> {
+        let stored = self
+            .identity
+            .reset_password_hash(
+                user_id,
+                password_hash,
+                mutation_audit(
+                    context,
+                    "user.password.reset",
+                    "user",
+                    user_id,
+                    vec!["password".to_owned(), "session_version".to_owned()],
+                ),
+            )
+            .await
+            .map_err(|error| admin_store_error("user password", error))?;
+        identity_user_record(stored)
+    }
+
+    async fn bump_user_session_version(
+        &self,
+        user_id: &str,
+        context: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::users::UserRecord> {
+        let stored = self
+            .identity
+            .bump_session_version(
+                user_id,
+                mutation_audit(
+                    context,
+                    "user.sessions.revoke",
+                    "user",
+                    user_id,
+                    vec!["session_version".to_owned()],
+                ),
+            )
+            .await
+            .map_err(|error| admin_store_error("user sessions", error))?;
+        identity_user_record(stored)
+    }
+
+    async fn delete_user(
+        &self,
+        user_id: &str,
+        context: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        self.identity
+            .delete_user(
+                user_id,
+                mutation_audit(
+                    context,
+                    "user.delete",
+                    "user",
+                    user_id,
+                    vec![
+                        "user".to_owned(),
+                        "owned_client_keys".to_owned(),
+                        "groups".to_owned(),
+                        "budget_windows".to_owned(),
+                    ],
+                ),
+            )
+            .await
+            .map(admin_revision)
+            .map_err(|error| admin_store_error("user identity", error))?
+    }
+
+    async fn load_session_ttl_settings(
+        &self,
+    ) -> AdminStoreResult<Option<gateway_admin::model::users::SessionTtlSettings>> {
+        self.identity
+            .session_ttl_settings()
+            .await
+            .map(|settings| {
+                settings.map(|(admin_minutes, user_minutes)| {
+                    gateway_admin::model::users::SessionTtlSettings::new(
+                        admin_minutes,
+                        user_minutes,
+                    )
+                })
+            })
+            .map_err(|error| admin_store_error("auth settings", error))
+    }
+
+    async fn replace_session_ttl_settings(
+        &self,
+        settings: gateway_admin::model::users::SessionTtlSettings,
+        context: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::users::SessionTtlSettings> {
+        self.identity
+            .replace_session_ttl_settings(
+                settings.admin_minutes,
+                settings.user_minutes,
+                mutation_audit(
+                    context,
+                    "auth.session_ttl.update",
+                    "auth_settings",
+                    "1",
+                    vec![
+                        "admin_session_ttl_minutes".to_owned(),
+                        "user_session_ttl_minutes".to_owned(),
+                    ],
+                ),
+            )
+            .await
+            .map_err(|error| admin_store_error("auth settings", error))?;
+        Ok(settings)
+    }
+
+    async fn load_turnstile_settings(
+        &self,
+    ) -> AdminStoreResult<gateway_admin::model::users::TurnstileSettings> {
+        self.identity
+            .auth_settings()
+            .await
+            .map(|settings| {
+                gateway_admin::model::users::TurnstileSettings::new(
+                    settings.turnstile_enabled,
+                    settings.turnstile_site_key,
+                    settings.turnstile_secret_key,
+                )
+            })
+            .map_err(|error| admin_store_error("auth settings", error))
+    }
+
+    async fn replace_turnstile_settings(
+        &self,
+        settings: gateway_admin::model::users::TurnstileSettings,
+        context: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::users::TurnstileSettings> {
+        let stored = postgres::StoredAuthSettings {
+            turnstile_enabled: settings.enabled,
+            turnstile_site_key: settings.site_key.clone(),
+            turnstile_secret_key: settings.secret_for_store().map(str::to_owned),
+        };
+        self.identity
+            .replace_auth_settings(
+                &stored,
+                mutation_audit(
+                    context,
+                    "auth.turnstile.update",
+                    "auth_settings",
+                    "1",
+                    vec![
+                        "turnstile_enabled".to_owned(),
+                        "turnstile_site_key".to_owned(),
+                        "turnstile_secret_key".to_owned(),
+                    ],
+                ),
+            )
+            .await
+            .map_err(|error| admin_store_error("auth settings", error))?;
+        Ok(settings)
     }
 
     async fn load_admin_api_key(&self) -> AdminStoreResult<Option<AdminApiKey>> {
@@ -328,25 +659,26 @@ impl AuthStore for AuthStoreAdapter {
     }
 
     async fn store_session(&self, session_id: &str, session: &AuthSession) -> AdminStoreResult<()> {
-        let subject = match &session.subject {
-            SessionSubject::Admin {
-                admin_user_id,
-                credential_fingerprint,
-            } => redis::SessionSubjectRecord::Admin {
-                admin_user_id: admin_user_id.clone(),
-                credential_fingerprint: credential_fingerprint.clone(),
-            },
-            SessionSubject::Key { client_key_id } => redis::SessionSubjectRecord::Key {
-                client_key_id: client_key_id.as_str().to_owned(),
-            },
-        };
         redis::AuthStateRepository::store_session(
             &self.state,
             session_id,
-            &redis::AuthSessionRecord {
-                subject,
-                expires_at: session.expires_at,
-            },
+            &auth_session_record(session),
+        )
+        .await
+        .map_err(|error| admin_store_error("authentication session", error))
+    }
+
+    async fn replace_session_if_matches(
+        &self,
+        session_id: &str,
+        expected: &AuthSession,
+        replacement: &AuthSession,
+    ) -> AdminStoreResult<bool> {
+        redis::AuthStateRepository::replace_session_if_matches(
+            &self.state,
+            session_id,
+            &auth_session_record(expected),
+            &auth_session_record(replacement),
         )
         .await
         .map_err(|error| admin_store_error("authentication session", error))
@@ -395,6 +727,90 @@ impl AuthStore for AuthStoreAdapter {
     }
 }
 
+fn identity_user_record(
+    stored: postgres::StoredUser,
+) -> AdminStoreResult<gateway_admin::model::users::UserRecord> {
+    let role = gateway_admin::model::users::UserRole::parse(&stored.role).ok_or_else(|| {
+        AdminStoreError::new(
+            AdminStoreErrorKind::Invalid,
+            "user identity",
+            "stored user role is invalid",
+        )
+    })?;
+    Ok(gateway_admin::model::users::UserRecord {
+        id: stored.id,
+        username: stored.username,
+        role,
+        enabled: stored.enabled,
+        limits: UserRateLimits {
+            max_concurrency: stored
+                .max_concurrency
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| {
+                    AdminStoreError::new(
+                        AdminStoreErrorKind::Invalid,
+                        "user identity",
+                        "stored user max concurrency is invalid",
+                    )
+                })?,
+            requests_per_minute: stored
+                .requests_per_minute
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| {
+                    AdminStoreError::new(
+                        AdminStoreErrorKind::Invalid,
+                        "user identity",
+                        "stored user requests per minute is invalid",
+                    )
+                })?,
+        },
+        session_version: u64::try_from(stored.session_version).map_err(|_| {
+            AdminStoreError::new(
+                AdminStoreErrorKind::Invalid,
+                "user identity",
+                "stored session version is invalid",
+            )
+        })?,
+        created_at: stored.created_at,
+        updated_at: stored.updated_at,
+    })
+}
+
+fn identity_user_credential(
+    stored: postgres::StoredUser,
+) -> AdminStoreResult<gateway_admin::model::users::UserCredentialRecord> {
+    let password_hash = stored.password_hash.clone();
+    Ok(gateway_admin::model::users::UserCredentialRecord {
+        user: identity_user_record(stored)?,
+        password_hash,
+    })
+}
+
+fn stored_user(user: &gateway_admin::model::users::UserCredentialRecord) -> postgres::StoredUser {
+    postgres::StoredUser {
+        id: user.user.id.clone(),
+        username: user.user.username.clone(),
+        password_hash: user.password_hash.clone(),
+        role: user.user.role.as_str().to_owned(),
+        enabled: user.user.enabled,
+        max_concurrency: user
+            .user
+            .limits
+            .max_concurrency
+            .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+        requests_per_minute: user
+            .user
+            .limits
+            .requests_per_minute
+            .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+        session_version: i64::try_from(user.user.session_version).unwrap_or(i64::MAX),
+        created_at: user.user.created_at,
+        updated_at: user.user.updated_at,
+    }
+}
+
 fn auth_audit_record(event: AdminAuditModel) -> AdminStoreResult<postgres::AdminAuditEvent> {
     let config_revision = event
         .config_revision
@@ -408,6 +824,9 @@ fn auth_audit_record(event: AdminAuditModel) -> AdminStoreResult<postgres::Admin
             )
         })?;
     let actor_kind = match event.actor_kind {
+        gateway_admin::model::auth::AuditActorKind::UserSession => {
+            postgres::AdminAuditActorKind::UserSession
+        }
         gateway_admin::model::auth::AuditActorKind::AdminSession => {
             postgres::AdminAuditActorKind::AdminSession
         }
@@ -434,6 +853,32 @@ fn auth_audit_record(event: AdminAuditModel) -> AdminStoreResult<postgres::Admin
     })
 }
 
+fn auth_session_record(session: &AuthSession) -> redis::AuthSessionRecord {
+    let subject = match &session.subject {
+        SessionSubject::Admin {
+            admin_user_id,
+            credential_fingerprint,
+        } => redis::SessionSubjectRecord::Admin {
+            admin_user_id: admin_user_id.clone(),
+            credential_fingerprint: credential_fingerprint.clone(),
+        },
+        SessionSubject::User {
+            user_id,
+            credential_fingerprint,
+        } => redis::SessionSubjectRecord::User {
+            user_id: user_id.clone(),
+            credential_fingerprint: credential_fingerprint.clone(),
+        },
+        SessionSubject::Key { client_key_id } => redis::SessionSubjectRecord::Key {
+            client_key_id: client_key_id.as_str().to_owned(),
+        },
+    };
+    redis::AuthSessionRecord {
+        subject,
+        expires_at: session.expires_at,
+    }
+}
+
 fn auth_session(record: redis::AuthSessionRecord) -> AdminStoreResult<AuthSession> {
     let subject = match record.subject {
         redis::SessionSubjectRecord::Admin {
@@ -441,6 +886,13 @@ fn auth_session(record: redis::AuthSessionRecord) -> AdminStoreResult<AuthSessio
             credential_fingerprint,
         } => SessionSubject::Admin {
             admin_user_id,
+            credential_fingerprint,
+        },
+        redis::SessionSubjectRecord::User {
+            user_id,
+            credential_fingerprint,
+        } => SessionSubject::User {
+            user_id,
             credential_fingerprint,
         },
         redis::SessionSubjectRecord::Key { client_key_id } => SessionSubject::Key {

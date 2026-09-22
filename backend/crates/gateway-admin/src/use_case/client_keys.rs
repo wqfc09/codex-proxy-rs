@@ -11,12 +11,12 @@ use uuid::Uuid;
 
 use crate::{
     model::{
-        AdminError, MutationContext,
+        AdminError,
         client_keys::{
             ClientKeyCursorValue, ClientKeyListQuery, ClientKeyMutation, ClientKeyPage,
             ClientKeySecret, ClientKeySortField, CreateClientKey, CreatedClientKey,
-            DeleteClientKey, NewClientKey, ResetClientKeyBudget, SetClientKeyEnabled,
-            UpdateClientKey,
+            DeleteClientKey, NewClientKey, ReplaceClientKeyIdentity, ResetClientKeyBudget,
+            SetClientKeyEnabled, UpdateClientKey,
         },
     },
     ports::store::{AdminStoreError, AdminStoreErrorKind, ClientKeyStore},
@@ -27,104 +27,130 @@ use super::{map_store_error, publish_committed};
 /// API 消费的 Client Key 管理服务。
 #[async_trait]
 pub trait ClientKeyService: Send + Sync {
-    async fn list(&self, query: ClientKeyListQuery) -> Result<ClientKeyPage, AdminError>;
-    async fn reveal(&self, id: &ClientApiKeyId) -> Result<ClientKeySecret, AdminError>;
-    async fn create(
+    async fn reset_budget_for_user(
         &self,
-        context: &MutationContext,
-        command: CreateClientKey,
-    ) -> Result<CreatedClientKey, AdminError>;
-    async fn update(
-        &self,
-        context: &MutationContext,
-        command: UpdateClientKey,
-    ) -> Result<ClientKeyMutation, AdminError>;
-    async fn set_enabled(
-        &self,
-        context: &MutationContext,
-        command: SetClientKeyEnabled,
-    ) -> Result<ClientKeyMutation, AdminError>;
-    async fn delete(
-        &self,
-        context: &MutationContext,
-        command: DeleteClientKey,
-    ) -> Result<ClientKeyMutation, AdminError>;
-    async fn reset_budget(
-        &self,
-        context: &MutationContext,
+        user_id: &str,
         command: ResetClientKeyBudget,
     ) -> Result<ClientApiKeyId, AdminError>;
+    async fn list_for_user(
+        &self,
+        user_id: &str,
+        query: ClientKeyListQuery,
+    ) -> Result<ClientKeyPage, AdminError>;
+    async fn reveal_for_user(
+        &self,
+        user_id: &str,
+        id: &ClientApiKeyId,
+    ) -> Result<ClientKeySecret, AdminError>;
+    async fn replace_identity_for_user(
+        &self,
+        context: &crate::model::MutationContext,
+        user_id: &str,
+        command: ReplaceClientKeyIdentity,
+    ) -> Result<ClientKeyMutation, AdminError>;
+    async fn create_for_user(
+        &self,
+        user_id: &str,
+        command: CreateClientKey,
+    ) -> Result<CreatedClientKey, AdminError>;
+    async fn update_for_user(
+        &self,
+        user_id: &str,
+        command: UpdateClientKey,
+    ) -> Result<ClientKeyMutation, AdminError>;
+    async fn set_enabled_for_user(
+        &self,
+        user_id: &str,
+        command: SetClientKeyEnabled,
+    ) -> Result<ClientKeyMutation, AdminError>;
+    async fn delete_for_user(
+        &self,
+        user_id: &str,
+        command: DeleteClientKey,
+    ) -> Result<ClientKeyMutation, AdminError>;
 }
 
 pub(crate) struct DefaultClientKeyService {
-    providers: crate::ports::provider::ProviderAdminRegistry,
     store: Arc<dyn ClientKeyStore>,
     snapshot: Arc<dyn SnapshotControl>,
 }
 
 impl DefaultClientKeyService {
     #[must_use]
-    pub(crate) fn new(
-        store: Arc<dyn ClientKeyStore>,
-        snapshot: Arc<dyn SnapshotControl>,
-        providers: crate::ports::provider::ProviderAdminRegistry,
-    ) -> Self {
-        Self {
-            store,
-            snapshot,
-            providers,
-        }
+    pub(crate) fn new(store: Arc<dyn ClientKeyStore>, snapshot: Arc<dyn SnapshotControl>) -> Self {
+        Self { store, snapshot }
     }
 }
 
 #[async_trait]
 impl ClientKeyService for DefaultClientKeyService {
-    async fn reset_budget(
+    async fn reset_budget_for_user(
         &self,
-        context: &MutationContext,
+        user_id: &str,
         command: ResetClientKeyBudget,
     ) -> Result<ClientApiKeyId, AdminError> {
         let id = command.id.clone();
         self.store
-            .reset_client_key_budget(command, context)
+            .reset_user_client_key_budget(user_id, command)
             .await
             .map_err(|error| map_store_error(error, "client API key"))?;
         Ok(id)
     }
 
-    async fn list(&self, query: ClientKeyListQuery) -> Result<ClientKeyPage, AdminError> {
+    async fn list_for_user(
+        &self,
+        user_id: &str,
+        query: ClientKeyListQuery,
+    ) -> Result<ClientKeyPage, AdminError> {
         validate_cursor(&query)?;
         self.store
-            .list_client_keys(query)
+            .list_user_client_keys(user_id, query)
             .await
             .map_err(|error| map_store_error(error, "client API key"))
     }
 
-    async fn reveal(&self, id: &ClientApiKeyId) -> Result<ClientKeySecret, AdminError> {
+    async fn reveal_for_user(
+        &self,
+        user_id: &str,
+        id: &ClientApiKeyId,
+    ) -> Result<ClientKeySecret, AdminError> {
         self.store
-            .reveal_client_key(id)
+            .reveal_user_client_key(user_id, id)
             .await
             .map_err(|error| map_store_error(error, "client API key"))?
             .ok_or_else(|| AdminError::not_found("Client API Key 不存在"))
     }
 
-    async fn create(
+    async fn replace_identity_for_user(
         &self,
-        context: &MutationContext,
+        context: &crate::model::MutationContext,
+        user_id: &str,
+        command: ReplaceClientKeyIdentity,
+    ) -> Result<ClientKeyMutation, AdminError> {
+        let id = command.id.clone();
+        let (config_revision, record) = self
+            .store
+            .replace_user_client_key_identity(user_id, command, context)
+            .await
+            .map_err(|error| map_store_error(error, "client API key"))?;
+        publish_committed(self.snapshot.as_ref(), config_revision).await?;
+        Ok(ClientKeyMutation {
+            config_revision,
+            record: Some(record),
+            id,
+        })
+    }
+
+    async fn create_for_user(
+        &self,
+        user_id: &str,
         command: CreateClientKey,
     ) -> Result<CreatedClientKey, AdminError> {
-        for (provider, profile) in [
-            ("openai", &command.openai_client_profile_override),
-            ("xai", &command.xai_client_profile_override),
-        ] {
-            if let Some(profile) = profile {
-                let kind = gateway_core::routing::ProviderKind::new(provider)
-                    .map_err(|_| AdminError::invalid("Provider 不合法"))?;
-                self.providers
-                    .require(&kind)
-                    .and_then(|provider| provider.preview_client_profile(profile))
-                    .map_err(|error| super::map_provider_error(error, "client profile"))?;
-            }
+        if !command.group_ids.is_empty()
+            || command.openai_client_profile_override.is_some()
+            || command.xai_client_profile_override.is_some()
+        {
+            return Err(AdminError::invalid("普通用户 API Key 不接受账号分组配置"));
         }
         let id = ClientApiKeyId::new(format!("key_{}", Uuid::now_v7().simple()))
             .map_err(|_| AdminError::internal("创建 Client API Key ID 失败"))?;
@@ -137,7 +163,8 @@ impl ClientKeyService for DefaultClientKeyService {
         };
         let (config_revision, record) = self
             .store
-            .create_client_key(
+            .create_user_client_key(
+                user_id,
                 NewClientKey {
                     openai_client_profile_override: command.openai_client_profile_override,
                     xai_client_profile_override: command.xai_client_profile_override,
@@ -149,7 +176,6 @@ impl ClientKeyService for DefaultClientKeyService {
                     budget: command.budget,
                     plaintext: plaintext.clone(),
                 },
-                context,
             )
             .await
             .map_err(map_client_key_write_error)?;
@@ -160,28 +186,21 @@ impl ClientKeyService for DefaultClientKeyService {
         })
     }
 
-    async fn update(
+    async fn update_for_user(
         &self,
-        context: &MutationContext,
+        user_id: &str,
         command: UpdateClientKey,
     ) -> Result<ClientKeyMutation, AdminError> {
-        for (provider, profile) in [
-            ("openai", &command.openai_client_profile_override),
-            ("xai", &command.xai_client_profile_override),
-        ] {
-            if let Some(Some(profile)) = profile {
-                let kind = gateway_core::routing::ProviderKind::new(provider)
-                    .map_err(|_| AdminError::invalid("Provider 不合法"))?;
-                self.providers
-                    .require(&kind)
-                    .and_then(|provider| provider.preview_client_profile(profile))
-                    .map_err(|error| super::map_provider_error(error, "client profile"))?;
-            }
+        if !command.group_ids.is_empty()
+            || command.openai_client_profile_override.is_some()
+            || command.xai_client_profile_override.is_some()
+        {
+            return Err(AdminError::invalid("普通用户 API Key 不接受账号分组配置"));
         }
         let id = command.id.clone();
         let (config_revision, record) = self
             .store
-            .update_client_key(command, context)
+            .update_user_client_key(user_id, command)
             .await
             .map_err(map_client_key_write_error)?;
         publish_committed(self.snapshot.as_ref(), config_revision).await?;
@@ -191,18 +210,17 @@ impl ClientKeyService for DefaultClientKeyService {
             id,
         })
     }
-
-    async fn set_enabled(
+    async fn set_enabled_for_user(
         &self,
-        context: &MutationContext,
+        user_id: &str,
         command: SetClientKeyEnabled,
     ) -> Result<ClientKeyMutation, AdminError> {
         let id = command.id.clone();
-        let (config_revision, record) =
-            self.store
-                .set_client_key_enabled(command, context)
-                .await
-                .map_err(|error| map_store_error(error, "client API key"))?;
+        let (config_revision, record) = self
+            .store
+            .set_user_client_key_enabled(user_id, command)
+            .await
+            .map_err(|error| map_store_error(error, "client API key"))?;
         publish_committed(self.snapshot.as_ref(), config_revision).await?;
         Ok(ClientKeyMutation {
             config_revision,
@@ -210,16 +228,15 @@ impl ClientKeyService for DefaultClientKeyService {
             id,
         })
     }
-
-    async fn delete(
+    async fn delete_for_user(
         &self,
-        context: &MutationContext,
+        user_id: &str,
         command: DeleteClientKey,
     ) -> Result<ClientKeyMutation, AdminError> {
         let id = command.id.clone();
         let config_revision = self
             .store
-            .delete_client_key(command, context)
+            .delete_user_client_key(user_id, command)
             .await
             .map_err(|error| map_store_error(error, "client API key"))?;
         publish_committed(self.snapshot.as_ref(), config_revision).await?;

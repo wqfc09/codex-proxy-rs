@@ -279,6 +279,8 @@ pub(crate) fn usage_list_record_view(record: domain::UsageListRecord) -> UsageLi
         .clone()
         .or_else(|| record.requested_model_id.clone());
     UsageListRecordView {
+        user_id: record.user_id,
+        username: record.username,
         client_api_key_name: record.client_api_key_name,
         id: record.id,
         provider: record.provider_kind,
@@ -371,6 +373,8 @@ pub(crate) fn usage_record_view(record: domain::UsageRecord) -> UsageRecordView 
     UsageRecordView {
         id: record.id.clone(),
         request_id: record.id,
+        user_id: record.user_id,
+        username: record.username,
         client_api_key_id: Some(record.client_api_key_ref),
         routing_scope: record.routing_scope,
         routing_group_refs: record.routing_group_refs,

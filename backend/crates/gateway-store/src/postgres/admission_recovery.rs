@@ -10,9 +10,10 @@ use gateway_core::{
         admission::{
             ClientAdmissionError, ClientAdmissionRecovery as CoreAdmissionRecovery,
             ClientAdmissionRecoveryPort, RecentAdmissionFact, RunningAdmissionFact,
+            UserAdmissionRecovery as CoreUserAdmissionRecovery,
         },
     },
-    policy::ClientApiKeyId,
+    policy::{ClientApiKeyId, UserId},
 };
 use sqlx::PgPool;
 
@@ -31,10 +32,18 @@ pub struct ClientAdmissionRunningRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAdmissionUserRecovery {
+    pub user_id: String,
+    pub recent_requests: Vec<ClientAdmissionRecentRequest>,
+    pub running_requests: Vec<ClientAdmissionRunningRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAdmissionRecovery {
     pub client_api_key_ref: String,
     pub recent_requests: Vec<ClientAdmissionRecentRequest>,
     pub running_requests: Vec<ClientAdmissionRunningRequest>,
+    pub user: Option<ClientAdmissionUserRecovery>,
 }
 
 #[async_trait]
@@ -63,25 +72,65 @@ impl ClientAdmissionRecoveryRepository for PgClientAdmissionRecoveryRepository {
         &self,
         window_started_at: DateTime<Utc>,
     ) -> StoreResult<Vec<ClientAdmissionRecovery>> {
-        let rows = sqlx::query_as::<_, (String, String, DateTime<Utc>, DateTime<Utc>, String)>(
-            "select client_api_key_ref, id, started_at, deadline_at, outcome
-             from model_requests
-             where started_at >= $1 or outcome = 'running'
-             order by client_api_key_ref, started_at, id",
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                DateTime<Utc>,
+                DateTime<Utc>,
+                String,
+                Option<String>,
+            ),
+        >(
+            "select mr.client_api_key_ref, mr.id, mr.started_at, mr.deadline_at, mr.outcome,
+                    u.id
+             from model_requests mr
+             left join users u on u.id = mr.user_id and u.enabled
+             where mr.started_at >= $1 or mr.outcome = 'running'
+             order by mr.client_api_key_ref, mr.started_at, mr.id",
         )
         .bind(window_started_at)
         .fetch_all(&self.pool)
         .await
         .map_err(|_| postgres_unavailable("load client admission recovery"))?;
         let mut recoveries = BTreeMap::<String, ClientAdmissionRecovery>::new();
-        for (client_api_key_ref, model_request_id, started_at, deadline_at, outcome) in rows {
+        for (client_api_key_ref, model_request_id, started_at, deadline_at, outcome, user_id) in
+            rows
+        {
             let recovery = recoveries
                 .entry(client_api_key_ref.clone())
                 .or_insert_with(|| ClientAdmissionRecovery {
                     client_api_key_ref,
                     recent_requests: Vec::new(),
                     running_requests: Vec::new(),
+                    user: None,
                 });
+            if let Some(user_id) = user_id {
+                let user = recovery
+                    .user
+                    .get_or_insert_with(|| ClientAdmissionUserRecovery {
+                        user_id: user_id.clone(),
+                        recent_requests: Vec::new(),
+                        running_requests: Vec::new(),
+                    });
+                // User 归属取请求冻结的 user_id；即使当前 Key 已删除，也不能丢失
+                // 已准入请求的共享 User 窗口事实或用当前所有者重新解释历史。
+                if user.user_id == user_id {
+                    if started_at >= window_started_at {
+                        user.recent_requests.push(ClientAdmissionRecentRequest {
+                            model_request_id: model_request_id.clone(),
+                            started_at,
+                        });
+                    }
+                    if outcome == "running" {
+                        user.running_requests.push(ClientAdmissionRunningRequest {
+                            model_request_id: model_request_id.clone(),
+                            deadline_at,
+                        });
+                    }
+                }
+            }
             if started_at >= window_started_at {
                 recovery.recent_requests.push(ClientAdmissionRecentRequest {
                     model_request_id: model_request_id.clone(),
@@ -137,10 +186,49 @@ impl ClientAdmissionRecoveryPort for PgClientAdmissionRecoveryRepository {
                             })
                         })
                         .collect::<Result<Vec<_>, ClientAdmissionError>>()?;
+                    let user = recovery
+                        .user
+                        .map(|user| {
+                            let user_id =
+                                UserId::new(user.user_id).map_err(|_| ClientAdmissionError)?;
+                            let recent_requests = user
+                                .recent_requests
+                                .into_iter()
+                                .map(|request| {
+                                    Ok(RecentAdmissionFact {
+                                        model_request_id: ModelRequestId::new(
+                                            request.model_request_id,
+                                        )
+                                        .map_err(|_| ClientAdmissionError)?,
+                                        started_at: request.started_at.into(),
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, ClientAdmissionError>>()?;
+                            let running_requests = user
+                                .running_requests
+                                .into_iter()
+                                .map(|request| {
+                                    Ok(RunningAdmissionFact {
+                                        model_request_id: ModelRequestId::new(
+                                            request.model_request_id,
+                                        )
+                                        .map_err(|_| ClientAdmissionError)?,
+                                        expires_at: request.deadline_at.into(),
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, ClientAdmissionError>>()?;
+                            Ok(CoreUserAdmissionRecovery {
+                                user_id,
+                                recent_requests,
+                                running_requests,
+                            })
+                        })
+                        .transpose()?;
                     Ok(CoreAdmissionRecovery {
                         client_api_key_id,
                         recent_requests,
                         running_requests,
+                        user,
                     })
                 })
                 .collect()

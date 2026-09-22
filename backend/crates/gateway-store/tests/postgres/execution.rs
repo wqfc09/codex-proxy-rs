@@ -17,7 +17,7 @@ use gateway_core::error::{
 };
 use gateway_core::metering::{CalculatedCost, CostEstimate, Usage};
 use gateway_core::operation::OperationKind;
-use gateway_core::policy::ClientApiKeyId;
+use gateway_core::policy::{ClientApiKeyId, SubscriptionId, UserId};
 use gateway_core::routing::{AccountRoutingSnapshot, ConfigRevision, PublicModelId};
 use gateway_core::upstream::UpstreamSendState;
 use gateway_store::postgres::{
@@ -44,6 +44,12 @@ fn model_request_rejects_mismatched_client_key_live_id() {
         id: "request-1".to_owned(),
         client_api_key_id: Some("key-live".to_owned()),
         client_api_key_ref: "key-history".to_owned(),
+        user_id: None,
+        plan_id: None,
+        subscription_id: None,
+        downstream_rate_multiplier: None,
+        username_snapshot: None,
+        client_api_key_name_snapshot: None,
         config_revision: 1,
         protocol: "openai".to_owned(),
         operation: "responses".to_owned(),
@@ -66,6 +72,58 @@ fn model_request_rejects_mismatched_client_key_live_id() {
         deadline_at: started_at + Duration::seconds(30),
     };
     assert!(request.validate().is_err());
+}
+
+#[tokio::test]
+async fn model_request_persists_user_billing_and_historical_names() {
+    let Some(database) = TestDatabase::create("execution_user_billing_metadata").await else {
+        return;
+    };
+    let plan_id: String = sqlx::query_scalar("select id from subscription_plans where is_base")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    let mut request = accepted_request("req_user_billing_metadata");
+    request.user_id = Some(UserId::new("user_history").unwrap());
+    request.plan_id = Some(SubscriptionId::new(plan_id.clone()).unwrap());
+    request.subscription_id = None;
+    request.downstream_rate_multiplier = Some("1.25".parse().unwrap());
+    request.username_snapshot = Some("history-user".to_owned());
+    request.client_api_key_name_snapshot = Some("history-key".to_owned());
+    PgExecutionStore::new(database.pool.clone())
+        .create_model_request(request)
+        .await
+        .unwrap();
+    type FrozenBillingRow = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: FrozenBillingRow = sqlx::query_as(
+        "select user_id, plan_id, subscription_id, downstream_rate_multiplier::text,
+                    username_snapshot, client_api_key_name_snapshot
+             from model_requests where id='req_user_billing_metadata'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0.as_deref(), Some("user_history"));
+    assert_eq!(row.1, Some(plan_id));
+    assert_eq!(row.2, None);
+    assert_eq!(
+        row.3
+            .unwrap()
+            .parse::<gateway_core::metering::Decimal>()
+            .unwrap()
+            .canonical(),
+        "1.25"
+    );
+    assert_eq!(row.4.as_deref(), Some("history-user"));
+    assert_eq!(row.5.as_deref(), Some("history-key"));
+    database.close().await;
 }
 
 #[tokio::test]
@@ -96,6 +154,12 @@ async fn merged_model_less_first_attempt_should_match_sequential_semantics() {
         id: "req_merged".to_owned(),
         client_api_key_id: None,
         client_api_key_ref: "key_merged".to_owned(),
+        user_id: None,
+        plan_id: None,
+        subscription_id: None,
+        downstream_rate_multiplier: None,
+        username_snapshot: None,
+        client_api_key_name_snapshot: None,
         config_revision: 1,
         protocol: "openai".to_owned(),
         operation: "generate_image".to_owned(),
@@ -211,6 +275,12 @@ async fn model_request_persists_group_routing_snapshot_without_live_group_foreig
             id: "req_group_history".to_owned(),
             client_api_key_id: None,
             client_api_key_ref: "key_group_history".to_owned(),
+            user_id: None,
+            plan_id: None,
+            subscription_id: None,
+            downstream_rate_multiplier: None,
+            username_snapshot: None,
+            client_api_key_name_snapshot: None,
             config_revision: 7,
             routing_scope: "groups".to_owned(),
             routing_group_refs: vec![
@@ -1217,6 +1287,7 @@ async fn seed_transport_recovery_request(
 }
 
 async fn seed_running_request(pool: &sqlx::PgPool, id: &str) -> Result<(), sqlx::Error> {
+    // 生产请求与终态都使用应用时间，fixture 也不能混用数据库时钟。
     sqlx::query(
         "insert into model_requests (
            id, client_api_key_ref, config_revision, protocol, operation, endpoint,
@@ -1224,10 +1295,11 @@ async fn seed_running_request(pool: &sqlx::PgPool, id: &str) -> Result<(), sqlx:
            started_at, deadline_at,
            routing_scope, routing_group_refs, routing_group_names_snapshot
          ) values ($1, 'key_status', 1, 'openai_responses', 'generate', '/v1/responses',
-           'http_json', 'status-model', 'openai', 'acct_status', 'unavailable', now(), now() + interval '1 minute',
+           'http_json', 'status-model', 'openai', 'acct_status', 'unavailable', $2, $2 + interval '1 minute',
            'all', '{}'::text[], '[]'::jsonb)",
     )
     .bind(id)
+    .bind(Utc::now())
     .execute(pool)
     .await?;
     Ok(())
@@ -1295,6 +1367,12 @@ pub(super) fn accepted_request(id: &str) -> CoreNewModelRequest {
         id: ModelRequestId::new(id).expect("request id"),
         client_api_key_id: None,
         client_api_key_ref: ClientApiKeyId::new("key_zero_attempt").expect("client key ref"),
+        user_id: None,
+        plan_id: None,
+        subscription_id: None,
+        downstream_rate_multiplier: None,
+        username_snapshot: None,
+        client_api_key_name_snapshot: None,
         config_revision: ConfigRevision::new(1).expect("revision"),
         routing: AccountRoutingSnapshot::all(),
         protocol: "openai".to_owned(),

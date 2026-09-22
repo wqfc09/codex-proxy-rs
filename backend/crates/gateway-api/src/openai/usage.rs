@@ -11,6 +11,7 @@ use axum::{
     routing::get,
 };
 use chrono::{DateTime, Utc};
+use gateway_admin::model::key_usage::KeyUsageAvailableBudget;
 use gateway_core::metering::Decimal;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -66,10 +67,26 @@ async fn usage(
     };
     Json(json!({
         "unit": "USD",
-        "daily": window(budget.limits.daily_usd, budget.daily_used_usd, budget.daily_resets_at),
-        "weekly": window(budget.limits.weekly_usd, budget.weekly_used_usd, budget.weekly_resets_at),
+        "daily": window(
+            budget.key.limits.daily_usd,
+            budget.key.daily_used_usd,
+            budget.key.daily_resets_at,
+        ),
+        "weekly": window(
+            budget.key.limits.weekly_usd,
+            budget.key.weekly_used_usd,
+            budget.key.weekly_resets_at,
+        ),
+        "available": available(&budget.available),
     }))
     .into_response()
+}
+
+fn available(budget: &KeyUsageAvailableBudget) -> Value {
+    json!({
+        "remaining": budget.remaining_usd.map(Decimal::canonical),
+        "resetsAt": budget.resets_at,
+    })
 }
 
 fn window(total: Decimal, used: Decimal, resets_at: Option<SystemTime>) -> Value {

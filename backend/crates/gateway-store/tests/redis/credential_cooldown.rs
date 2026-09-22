@@ -157,7 +157,15 @@ async fn credential_cooldown_read_removes_expired_grace_key() {
     let Some((repository, mut connection, namespace)) = repository().await else {
         return;
     };
-    let cooldown_until = Utc::now() + Duration::milliseconds(40);
+    // 生产读写都以 Redis TIME 判定 cooldown 到期；测试同样从 Redis 时钟构造边界，
+    // 避免宿主与容器几十毫秒的时钟漂移把 40ms 窗口变成不确定结果。
+    let (redis_seconds, redis_micros): (i64, i64) = redis::cmd("TIME")
+        .query_async(&mut connection)
+        .await
+        .expect("read Redis clock");
+    let redis_now = DateTime::from_timestamp_millis(redis_seconds * 1000 + redis_micros / 1000)
+        .expect("Redis clock is representable");
+    let cooldown_until = redis_now + Duration::milliseconds(40);
     let cooldown = CredentialCooldown {
         provider_account_id: "acct_cooldown_expiry".to_owned(),
         credential_revision: Revision::new(1).expect("positive revision"),

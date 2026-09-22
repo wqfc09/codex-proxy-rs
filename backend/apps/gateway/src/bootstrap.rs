@@ -88,6 +88,7 @@ pub async fn run() -> Result<(), BootstrapError> {
             client_distribution: host.client_distribution_resolver(),
             system: host.system_operations(),
             client_key_verifier: core.client_key_verifier(),
+            turnstile: host.turnstile_verifier(),
         },
     )
     .await?;

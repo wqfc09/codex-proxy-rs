@@ -7,18 +7,46 @@ use gateway_admin::{
     model::{
         auth::{AdminAuditEvent, AuthSession, LoginCommand},
         settings::AdminApiKey,
+        users::{UserCredentialRecord, UserRecord, UserRole},
     },
     ports::store::{AdminStoreResult, AuthStore},
 };
+use gateway_core::policy::UserRateLimits;
 
 #[derive(Default)]
 struct MemoryAuthStore {
+    turnstile_enabled: std::sync::atomic::AtomicBool,
     retry_after: Mutex<Option<std::time::Duration>>,
     unavailable: std::sync::atomic::AtomicBool,
     reject_delete: Mutex<Option<String>>,
     password_hash: Mutex<Option<String>>,
     sessions: Mutex<BTreeMap<String, AuthSession>>,
     audits: Mutex<Vec<AdminAuditEvent>>,
+}
+
+#[tokio::test]
+async fn convenience_login_cannot_bypass_enabled_turnstile_without_proof() {
+    let store = std::sync::Arc::new(MemoryAuthStore::default());
+    let services = super::AdminHarness::new().auth(store.clone()).build().await;
+    store
+        .turnstile_enabled
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let result = services
+        .auth()
+        .login(
+            LoginCommand {
+                username: None,
+                password: "strong-test-password".to_owned(),
+            },
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            None,
+        )
+        .await;
+    assert_eq!(
+        result,
+        Err(gateway_admin::model::auth::LoginError::InvalidCredentials)
+    );
+    assert!(store.sessions.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -32,7 +60,7 @@ async fn password_change_obeys_rate_limit_and_rejects_unbound_legacy_sessions() 
     let auth = services.auth();
     let login = auth
         .login(
-            LoginCommand::Admin {
+            LoginCommand {
                 username: None,
                 password: "strong-test-password".into(),
             },
@@ -75,6 +103,50 @@ async fn password_change_obeys_rate_limit_and_rejects_unbound_legacy_sessions() 
 
 #[async_trait]
 impl AuthStore for MemoryAuthStore {
+    async fn load_turnstile_settings(
+        &self,
+    ) -> AdminStoreResult<gateway_admin::model::users::TurnstileSettings> {
+        Ok(gateway_admin::model::users::TurnstileSettings::new(
+            self.turnstile_enabled
+                .load(std::sync::atomic::Ordering::SeqCst),
+            Some("test-site".to_owned()),
+            Some("test-secret".to_owned()),
+        ))
+    }
+    async fn load_user_by_username(
+        &self,
+        username: &str,
+    ) -> AdminStoreResult<Option<UserCredentialRecord>> {
+        if username != "admin" {
+            return Ok(None);
+        }
+        Ok(self
+            .password_hash
+            .lock()
+            .expect("password hash")
+            .clone()
+            .map(|password_hash| UserCredentialRecord {
+                user: UserRecord {
+                    id: "admin".to_owned(),
+                    username: "admin".to_owned(),
+                    role: UserRole::Admin,
+                    enabled: true,
+                    limits: UserRateLimits::default(),
+                    session_version: 1,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                password_hash,
+            }))
+    }
+
+    async fn load_user_by_id(
+        &self,
+        user_id: &str,
+    ) -> AdminStoreResult<Option<UserCredentialRecord>> {
+        self.load_user_by_username(user_id).await
+    }
+
     async fn load_password_hash(&self, _: &str) -> AdminStoreResult<Option<String>> {
         Ok(self.password_hash.lock().expect("password hash").clone())
     }
@@ -173,7 +245,7 @@ async fn successful_login_should_create_expiring_session_and_audit() {
     let result = services
         .auth()
         .login(
-            LoginCommand::Admin {
+            LoginCommand {
                 username: Some("admin".to_owned()),
                 password: "strong-test-password".to_owned(),
             },
@@ -212,7 +284,7 @@ async fn repeated_default_initialization_should_not_replace_password() {
         services
             .auth()
             .login(
-                LoginCommand::Admin {
+                LoginCommand {
                     username: Some("admin".to_owned()),
                     password: "first-strong-password".to_owned(),
                 },
@@ -237,7 +309,7 @@ async fn login_with_huge_session_ttl_should_clamp_expiry_instead_of_panicking() 
     let result = services
         .auth()
         .login(
-            LoginCommand::Admin {
+            LoginCommand {
                 username: Some("admin".to_owned()),
                 password: "strong-test-password".to_owned(),
             },
@@ -298,39 +370,62 @@ async fn expired_sessions_are_removed_and_store_outages_are_not_treated_as_logou
 }
 
 #[tokio::test]
-async fn both_login_types_share_the_login_limit_before_credentials_are_checked() {
+async fn inactive_legacy_key_session_is_revoked_without_restoring_key_login() {
+    use gateway_admin::model::auth::SessionSubject;
+    let store = std::sync::Arc::new(MemoryAuthStore::default());
+    store.sessions.lock().unwrap().insert(
+        "legacy-key".to_owned(),
+        AuthSession {
+            subject: SessionSubject::Key {
+                client_key_id: gateway_core::policy::ClientApiKeyId::new("key-legacy").unwrap(),
+            },
+            expires_at: Utc::now() + TimeDelta::hours(1),
+        },
+    );
+    let services = super::AdminHarness::new().auth(store.clone()).build().await;
+
+    assert!(
+        services
+            .auth()
+            .session(Some("legacy-key"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!store.sessions.lock().unwrap().contains_key("legacy-key"));
+}
+
+#[tokio::test]
+async fn login_limit_rejects_before_account_credentials_are_checked() {
     use gateway_admin::model::auth::LoginError;
     let store = std::sync::Arc::new(MemoryAuthStore::default());
     *store.retry_after.lock().unwrap() = Some(std::time::Duration::from_secs(37));
     let services = super::AdminHarness::new().auth(store).build().await;
-    for command in [
-        LoginCommand::Admin {
-            username: None,
-            password: "wrong-password".to_owned(),
-        },
-        LoginCommand::Key {
-            api_key: "unknown-key".to_owned(),
-        },
-    ] {
-        assert_eq!(
-            services
-                .auth()
-                .login(command, std::net::Ipv4Addr::LOCALHOST.into(), None)
-                .await
-                .unwrap_err(),
-            LoginError::TooManyAttempts {
-                retry_after_seconds: 37
-            }
-        );
-    }
+    let error = services
+        .auth()
+        .login(
+            LoginCommand {
+                username: None,
+                password: "wrong-password".to_owned(),
+            },
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        LoginError::TooManyAttempts {
+            retry_after_seconds: 37
+        }
+    );
 }
-
 #[tokio::test]
 async fn failed_rotation_discards_the_new_session_and_leaves_the_old_session_retryable() {
     use gateway_admin::model::auth::LoginError;
     let store = std::sync::Arc::new(MemoryAuthStore::default());
     let services = super::AdminHarness::new().auth(store.clone()).build().await;
-    let command = || LoginCommand::Admin {
+    let command = || LoginCommand {
         username: None,
         password: "strong-test-password".to_owned(),
     };

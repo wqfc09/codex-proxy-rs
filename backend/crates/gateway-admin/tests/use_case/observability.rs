@@ -871,6 +871,8 @@ fn total_record(
     now: DateTime<Utc>,
 ) -> UsageListRecord {
     UsageListRecord {
+        user_id: None,
+        username: None,
         client_api_key_name: Some("Production".to_owned()),
         id: id.to_owned(),
         endpoint: "/v1/responses".to_owned(),

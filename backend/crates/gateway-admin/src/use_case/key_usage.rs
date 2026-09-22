@@ -12,7 +12,7 @@ use crate::{
         auth::SessionSubject,
         client_keys::ClientKeySecret,
         key_usage::{
-            KeyUsageOverview, KeyUsageQuery, KeyUsageRecordKind, KeyUsageRecords,
+            KeyUsageBudget, KeyUsageOverview, KeyUsageQuery, KeyUsageRecordKind, KeyUsageRecords,
             KeyUsageRecordsQuery,
         },
         observability::{
@@ -20,13 +20,10 @@ use crate::{
         },
         system::SystemVersion,
     },
-    ports::store::{ClientKeyStore, ObservabilityStore},
+    ports::store::{ClientKeyStore, ObservabilityStore, SubscriptionBillingStore},
 };
 use gateway_core::{
-    engine::{
-        budget::ClientBudgetStatus,
-        execution::{ClientAuthenticationError, ClientKeyVerifier},
-    },
+    engine::execution::{ClientAuthenticationError, ClientKeyVerifier},
     policy::ClientApiKeyId,
 };
 
@@ -35,7 +32,7 @@ use super::{map_store_error, observability::health_timeline_at};
 #[async_trait]
 pub trait KeyUsageService: Send + Sync {
     /// 验证 Key 并只读查询当前额度，不记录 Key 使用或执行推理准入。
-    async fn budget(&self, plaintext: &str) -> Result<Option<ClientBudgetStatus>, AdminError>;
+    async fn budget(&self, plaintext: &str) -> Result<Option<KeyUsageBudget>, AdminError>;
 
     async fn version(&self, session_id: Option<&str>) -> Result<Option<SystemVersion>, AdminError>;
 
@@ -59,6 +56,7 @@ pub(crate) struct DefaultKeyUsageService {
     auth: Arc<dyn AuthService>,
     verifier: Arc<dyn ClientKeyVerifier>,
     keys: Arc<dyn ClientKeyStore>,
+    billing: Option<Arc<dyn SubscriptionBillingStore>>,
     observations: Arc<dyn ObservabilityStore>,
     system: Arc<dyn SystemService>,
 }
@@ -68,6 +66,7 @@ impl DefaultKeyUsageService {
         auth: Arc<dyn AuthService>,
         verifier: Arc<dyn ClientKeyVerifier>,
         keys: Arc<dyn ClientKeyStore>,
+        billing: Option<Arc<dyn SubscriptionBillingStore>>,
         observations: Arc<dyn ObservabilityStore>,
         system: Arc<dyn SystemService>,
     ) -> Self {
@@ -75,6 +74,7 @@ impl DefaultKeyUsageService {
             auth,
             verifier,
             keys,
+            billing,
             observations,
             system,
         }
@@ -88,10 +88,9 @@ impl DefaultKeyUsageService {
             .map(|session| session.subject)
         {
             Some(SessionSubject::Key { client_key_id }) => Ok(Some(client_key_id)),
-            Some(SessionSubject::Admin { .. }) => Err(AdminError::new(
-                AdminErrorKind::Forbidden,
-                "当前身份无权访问密钥用量接口",
-            )),
+            Some(SessionSubject::User { .. }) | Some(SessionSubject::Admin { .. }) => Err(
+                AdminError::new(AdminErrorKind::Forbidden, "当前身份无权访问密钥用量接口"),
+            ),
             None => Ok(None),
         }
     }
@@ -107,7 +106,7 @@ fn usage_filter(id: &ClientApiKeyId, model: Option<String>) -> UsageFilter {
 
 #[async_trait]
 impl KeyUsageService for DefaultKeyUsageService {
-    async fn budget(&self, plaintext: &str) -> Result<Option<ClientBudgetStatus>, AdminError> {
+    async fn budget(&self, plaintext: &str) -> Result<Option<KeyUsageBudget>, AdminError> {
         let id = match self.verifier.verify_client_key(plaintext) {
             Ok(id) => id,
             Err(ClientAuthenticationError::InvalidKey) => return Ok(None),
@@ -118,11 +117,33 @@ impl KeyUsageService for DefaultKeyUsageService {
                 ));
             }
         };
-        self.keys
-            .get_client_key(&id)
+        let Some(context) = self
+            .keys
+            .usage_budget_context(&id)
             .await
-            .map(|key| key.filter(|key| key.enabled).map(|key| key.budget))
-            .map_err(|error| map_store_error(error, "key usage budget"))
+            .map_err(|error| map_store_error(error, "key usage budget"))?
+            .filter(|context| context.enabled)
+        else {
+            return Ok(None);
+        };
+        let user_budget = if let Some(user_id) = context.owner_user_id.as_deref() {
+            let billing = self.billing.as_ref().ok_or_else(|| {
+                AdminError::new(AdminErrorKind::Unavailable, "用户额度查询暂时不可用")
+            })?;
+            Some(
+                billing
+                    .user_billing_summary(user_id)
+                    .await
+                    .map_err(|error| map_store_error(error, "user billing summary"))?
+                    .budget,
+            )
+        } else {
+            None
+        };
+        Ok(Some(KeyUsageBudget::resolve(
+            context.budget,
+            user_budget.as_ref(),
+        )))
     }
 
     async fn version(&self, session_id: Option<&str>) -> Result<Option<SystemVersion>, AdminError> {

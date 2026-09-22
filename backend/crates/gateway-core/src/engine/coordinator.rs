@@ -170,6 +170,7 @@ where
             concurrency_wait_budget: ConcurrencyWaitBudget::default(),
             observation: ResponseObservation::new(timing_started_at),
             budget_prior_attempts_usd: Decimal::ZERO,
+            budget_prior_attempts_known: false,
             budget_attempt_already_counted: false,
             trace,
             deadline,
@@ -276,6 +277,7 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     concurrency_wait_budget: ConcurrencyWaitBudget,
     observation: ResponseObservation,
     budget_prior_attempts_usd: Decimal,
+    budget_prior_attempts_known: bool,
     budget_attempt_already_counted: bool,
     trace: TraceContext,
     deadline: SystemTime,
@@ -528,6 +530,26 @@ where
             request_id: self.request_id.clone(),
             amount_usd,
             completed_at: self.finalized_at.unwrap_or_else(SystemTime::now),
+        }
+    }
+
+    /// 返回权威 USD 费用；未知费用保持 `None`，不得被解释成零。
+    #[must_use]
+    pub fn budget_cost(&self) -> Option<Decimal> {
+        let mut total = self
+            .budget_prior_attempts_usd
+            .checked_add(self.budget_attempt_usd())?;
+        if self.budget_attempt_already_counted {
+            total = self.budget_prior_attempts_usd;
+        }
+        // 历史 attempt 只在已有费用时累计；当前 attempt 未知时不能伪造 zero。
+        if !self.budget_attempt_already_counted
+            && self.observation.cost.total().is_none()
+            && !self.budget_prior_attempts_known
+        {
+            None
+        } else {
+            Some(total)
         }
     }
 
@@ -1477,6 +1499,11 @@ where
 
     fn reset_uncommitted_observations(&mut self) {
         // 响应观测按尝试隔离；被丢弃尝试中已取得的费用仍计入 Key。
+        self.budget_prior_attempts_known |= self
+            .observation
+            .cost
+            .total()
+            .is_some_and(|money| money.currency().as_str() == "USD");
         self.budget_prior_attempts_usd = self
             .budget_prior_attempts_usd
             .checked_add(self.budget_attempt_usd())

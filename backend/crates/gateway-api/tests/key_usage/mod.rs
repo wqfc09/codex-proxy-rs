@@ -12,18 +12,20 @@ use gateway_admin::model::observability::{RequestMetrics, china_day_start};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
-use crate::support::{RAW_KEY, cookie_request, empty_request, json_request, response_json};
+use crate::support::{cookie_request, empty_request, json_request, response_json};
 
 mod fixtures;
 
 const RANGE: &str = "startTime=2026-09-01T00:00:00Z&endTime=2026-09-02T00:00:00Z";
 
-async fn login(app: &Router, mode: &str) -> String {
-    let body = if mode == "key" {
-        json!({"mode": "key", "apiKey": RAW_KEY})
-    } else {
-        json!({"mode": "admin", "username": "admin_1", "password": "strong-admin-password"})
-    };
+fn legacy_key_cookie(fixture: &crate::admin::AdminTestFixture) -> String {
+    fixture.auth.insert_legacy_key_session("legacy-key");
+    "cpr_session=legacy-key".to_owned()
+}
+
+async fn admin_login(fixture: &crate::admin::AdminTestFixture) -> String {
+    let body = json!({"username": "admin_1", "password": "strong-admin-password"});
+    let app = crate::openai::api_router_with_admin(fixture.services.clone());
     let response = app
         .clone()
         .oneshot(json_request(Method::POST, "/api/auth/login", body))
@@ -58,7 +60,7 @@ async fn get(app: &Router, resource: &str, suffix: &str, cookie: &str) -> Respon
 async fn version_exposes_only_build_identifiers_for_key_sessions() {
     let fixture = fixtures::fixture().await;
     let app = crate::openai::api_router_with_admin(fixture.services.clone());
-    let cookie = login(&app, "key").await;
+    let cookie = legacy_key_cookie(&fixture);
     let response = get(&app, "version", "", &cookie).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -85,7 +87,7 @@ async fn version_exposes_only_build_identifiers_for_key_sessions() {
 async fn config_reveals_only_the_session_keys_name_and_plaintext() {
     let fixture = fixtures::fixture().await;
     let app = crate::openai::api_router_with_admin(fixture.services.clone());
-    let cookie = login(&app, "key").await;
+    let cookie = legacy_key_cookie(&fixture);
     let response = get(&app, "config", "", &cookie).await;
     assert_eq!(response.status(), StatusCode::OK);
     let data = response_json(response).await["data"].clone();
@@ -109,7 +111,7 @@ async fn config_reveals_only_the_session_keys_name_and_plaintext() {
 async fn config_rejects_caller_selected_scope() {
     let fixture = fixtures::fixture().await;
     let app = crate::openai::api_router_with_admin(fixture.services.clone());
-    let cookie = login(&app, "key").await;
+    let cookie = legacy_key_cookie(&fixture);
     for query in [
         "?keyId=other",
         "?id=other",
@@ -126,7 +128,7 @@ async fn config_rejects_caller_selected_scope() {
 async fn config_does_not_reveal_disabled_or_other_keys() {
     let fixture = fixtures::fixture().await;
     let app = crate::openai::api_router_with_admin(fixture.services.clone());
-    let cookie = login(&app, "key").await;
+    let cookie = legacy_key_cookie(&fixture);
     {
         let mut key = fixture.client_key.lock().unwrap();
         key.as_mut().unwrap().enabled = false;
@@ -164,7 +166,7 @@ fn assert_fields(value: &Value, expected: &[&str]) {
 async fn overview_scopes_every_query_and_projects_only_key_visible_fields() {
     let fixture = fixtures::fixture().await;
     let app = crate::openai::api_router_with_admin(fixture.services.clone());
-    let cookie = login(&app, "key").await;
+    let cookie = legacy_key_cookie(&fixture);
     let response = get(&app, "overview", "&model=%20coding%20", &cookie).await;
     assert_eq!(response.status(), StatusCode::OK);
     let data = response_json(response).await["data"].clone();
@@ -234,7 +236,7 @@ async fn overview_scopes_every_query_and_projects_only_key_visible_fields() {
 async fn records_keep_pagination_and_hide_admin_and_upstream_data() {
     let fixture = fixtures::fixture().await;
     let app = crate::openai::api_router_with_admin(fixture.services.clone());
-    let cookie = login(&app, "key").await;
+    let cookie = legacy_key_cookie(&fixture);
     for kind in ["success", "error"] {
         let response = get(
             &app,
@@ -313,8 +315,8 @@ async fn records_keep_pagination_and_hide_admin_and_upstream_data() {
 async fn missing_admin_and_revoked_sessions_cannot_read_key_usage() {
     let fixture = fixtures::fixture().await;
     let app = crate::openai::api_router_with_admin(fixture.services.clone());
-    let admin = login(&app, "admin").await;
-    let key = login(&app, "key").await;
+    let admin = admin_login(&fixture).await;
+    let key = legacy_key_cookie(&fixture);
     for resource in ["overview", "records", "config", "version"] {
         assert_eq!(
             get(&app, resource, "", "").await.status(),
@@ -338,7 +340,7 @@ async fn missing_admin_and_revoked_sessions_cannot_read_key_usage() {
 async fn unknown_scope_fields_and_unbounded_queries_are_rejected() {
     let fixture = fixtures::fixture().await;
     let app = crate::openai::api_router_with_admin(fixture.services.clone());
-    let cookie = login(&app, "key").await;
+    let cookie = legacy_key_cookie(&fixture);
     for resource in ["overview", "records"] {
         for extra in [
             "&clientApiKeyRef=other",
@@ -394,7 +396,7 @@ async fn unknown_scope_fields_and_unbounded_queries_are_rejected() {
 async fn empty_usage_has_zero_cost_but_unknown_pricing_stays_unknown() {
     let fixture = fixtures::fixture().await;
     let app = crate::openai::api_router_with_admin(fixture.services.clone());
-    let cookie = login(&app, "key").await;
+    let cookie = legacy_key_cookie(&fixture);
     for requests in [0, 2] {
         {
             let mut data = fixture.observations.lock().unwrap();
@@ -425,7 +427,7 @@ async fn empty_usage_has_zero_cost_but_unknown_pricing_stays_unknown() {
 async fn overview_does_not_mask_missing_keys_or_unavailable_observations() {
     let fixture = fixtures::fixture().await;
     let app = crate::openai::api_router_with_admin(fixture.services.clone());
-    let cookie = login(&app, "key").await;
+    let cookie = legacy_key_cookie(&fixture);
     fixture.observations.lock().unwrap().summary = None;
     assert_eq!(
         get(&app, "overview", "", &cookie).await.status(),

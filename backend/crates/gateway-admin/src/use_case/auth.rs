@@ -6,7 +6,6 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{Duration, Utc};
-use gateway_core::engine::execution::ClientKeyVerifier;
 use rand_core::{OsRng, RngCore as _};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq as _;
@@ -19,8 +18,9 @@ use crate::{
             AdminAuditEvent, AuditActorKind, AuthSession, ChangePassword, LoginCommand, LoginError,
             LoginResult, SessionSubject,
         },
+        users::{LoginProtectionProof, PublicAuthSettings, UserRecord, UserRole},
     },
-    ports::store::AuthStore,
+    ports::{auth::TurnstileVerifier, store::AuthStore},
 };
 
 use super::map_store_error;
@@ -40,6 +40,10 @@ pub trait AuthService: Send + Sync {
         &self,
         session_id: Option<&str>,
     ) -> Result<Option<String>, AdminError>;
+    async fn resolve_user(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Option<UserRecord>, AdminError>;
     async fn verify_admin_api_key(&self, key: &str) -> Result<bool, AdminError>;
     async fn login(
         &self,
@@ -47,7 +51,14 @@ pub trait AuthService: Send + Sync {
         source_ip: IpAddr,
         previous_session_id: Option<&str>,
     ) -> Result<LoginResult, LoginError>;
+    async fn login_with_protection(
+        &self,
+        command: LoginCommand,
+        protection: LoginProtectionProof,
+        previous_session_id: Option<&str>,
+    ) -> Result<LoginResult, LoginError>;
     async fn logout(&self, session_id: &str) -> Result<(), AdminError>;
+    async fn public_auth_settings(&self) -> Result<PublicAuthSettings, AdminError>;
 }
 
 const MAX_SESSION_TTL_MINUTES: i64 = 366 * 24 * 60;
@@ -58,9 +69,9 @@ const LOGIN_ATTEMPTS_GLOBAL: u32 = 200;
 pub(crate) struct DefaultAuthService {
     default_admin_user_id: String,
     admin_session_ttl: Duration,
-    key_session_ttl: Duration,
+    user_session_ttl: Duration,
     store: Arc<dyn AuthStore>,
-    verifier: Arc<dyn ClientKeyVerifier>,
+    turnstile: Arc<dyn TurnstileVerifier>,
 }
 
 impl DefaultAuthService {
@@ -68,16 +79,16 @@ impl DefaultAuthService {
     pub(crate) fn new(
         default_admin_user_id: impl Into<String>,
         admin_session_ttl_minutes: u64,
-        key_session_ttl_minutes: u64,
+        user_session_ttl_minutes: u64,
         store: Arc<dyn AuthStore>,
-        verifier: Arc<dyn ClientKeyVerifier>,
+        turnstile: Arc<dyn TurnstileVerifier>,
     ) -> Self {
         Self {
             default_admin_user_id: default_admin_user_id.into(),
             admin_session_ttl: session_ttl(admin_session_ttl_minutes),
-            key_session_ttl: session_ttl(key_session_ttl_minutes),
+            user_session_ttl: session_ttl(user_session_ttl_minutes),
             store,
-            verifier,
+            turnstile,
         }
     }
 
@@ -98,46 +109,155 @@ impl DefaultAuthService {
     }
 
     async fn authenticate(&self, command: LoginCommand) -> Result<SessionSubject, LoginError> {
-        match command {
-            LoginCommand::Admin { username, password } => {
-                if username.as_deref().unwrap_or(&self.default_admin_user_id)
-                    != self.default_admin_user_id
-                {
+        let LoginCommand { username, password } = command;
+        let username = match username.as_deref() {
+            Some(value) => {
+                let value = value.trim();
+                if value.is_empty() {
                     return Err(LoginError::InvalidCredentials);
                 }
-                let password_hash = self
-                    .store
-                    .load_password_hash(&self.default_admin_user_id)
-                    .await
-                    .map_err(|_| LoginError::Unavailable)?
-                    .ok_or(LoginError::InvalidCredentials)?;
-                if password.len() > 4096
-                    || !verify_admin_password(&password, &password_hash)
-                        .map_err(|_| LoginError::Unavailable)?
-                {
-                    return Err(LoginError::InvalidCredentials);
-                }
-                Ok(SessionSubject::Admin {
-                    admin_user_id: self.default_admin_user_id.clone(),
-                    credential_fingerprint: password_fingerprint(&password_hash),
-                })
+                value
             }
-            LoginCommand::Key { api_key } => {
-                if api_key.is_empty() || api_key.len() > 4096 {
-                    return Err(LoginError::InvalidCredentials);
-                }
-                let client_key_id = self.verifier.verify_client_key(&api_key)?;
-                if !self
-                    .store
-                    .client_key_enabled(&client_key_id)
-                    .await
-                    .map_err(|_| LoginError::Unavailable)?
-                {
-                    return Err(LoginError::InvalidCredentials);
-                }
-                Ok(SessionSubject::Key { client_key_id })
-            }
+            None => self.default_admin_user_id.as_str(),
+        };
+        let credential = self
+            .store
+            .load_user_by_username(username)
+            .await
+            .map_err(|_| LoginError::Unavailable)?
+            .ok_or(LoginError::InvalidCredentials)?;
+        if !credential.user.enabled
+            || password.len() > 4096
+            || !verify_admin_password(&password, &credential.password_hash)
+                .map_err(|_| LoginError::Unavailable)?
+        {
+            return Err(LoginError::InvalidCredentials);
         }
+        let fingerprint =
+            session_fingerprint(&credential.password_hash, credential.user.session_version);
+        Ok(match credential.user.role {
+            crate::model::users::UserRole::Admin => SessionSubject::Admin {
+                admin_user_id: credential.user.id,
+                credential_fingerprint: fingerprint,
+            },
+            crate::model::users::UserRole::User => SessionSubject::User {
+                user_id: credential.user.id,
+                credential_fingerprint: fingerprint,
+            },
+        })
+    }
+
+    async fn ensure_login_protection(
+        &self,
+        protection: &LoginProtectionProof,
+    ) -> Result<(), LoginError> {
+        let settings = self
+            .store
+            .load_turnstile_settings()
+            .await
+            .map_err(|_| LoginError::Unavailable)?;
+        if !settings.enabled {
+            return Ok(());
+        }
+        if settings.site_key.as_deref().is_none_or(str::is_empty) {
+            return Err(LoginError::Unavailable);
+        }
+        let secret = settings
+            .secret_for_verification()
+            .filter(|value| !value.is_empty())
+            .ok_or(LoginError::Unavailable)?;
+        let token = protection
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .ok_or(LoginError::InvalidCredentials)?;
+        match self
+            .turnstile
+            .verify(secret, token, protection.remote_ip)
+            .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(LoginError::InvalidCredentials),
+            Err(_) => Err(LoginError::Unavailable),
+        }
+    }
+
+    async fn login_inner(
+        &self,
+        command: LoginCommand,
+        source_ip: IpAddr,
+        previous_session_id: Option<&str>,
+        protection: LoginProtectionProof,
+    ) -> Result<LoginResult, LoginError> {
+        if let Some(retry_after) = self
+            .store
+            .consume_login_attempt(
+                source_ip,
+                LOGIN_ATTEMPTS_PER_SOURCE,
+                LOGIN_ATTEMPTS_GLOBAL,
+                LOGIN_WINDOW,
+            )
+            .await
+            .map_err(|_| LoginError::Unavailable)?
+        {
+            return Err(LoginError::TooManyAttempts {
+                retry_after_seconds: retry_after.as_secs().max(1),
+            });
+        }
+        self.ensure_login_protection(&protection).await?;
+        let subject = self.authenticate(command).await?;
+        let ttl_override = self
+            .store
+            .load_session_ttl_settings()
+            .await
+            .map_err(|_| LoginError::Unavailable)?;
+        let ttl = match (&subject, ttl_override) {
+            (SessionSubject::Admin { .. }, Some(settings)) => session_ttl(settings.admin_minutes),
+            (SessionSubject::User { .. }, Some(settings)) => session_ttl(settings.user_minutes),
+            (SessionSubject::Admin { .. }, None) => self.admin_session_ttl,
+            (SessionSubject::User { .. }, None) => self.user_session_ttl,
+            (SessionSubject::Key { .. }, _) => return Err(LoginError::Unavailable),
+        };
+        let session = AuthSession {
+            subject,
+            expires_at: Utc::now() + ttl,
+        };
+        let session_id = random_session_token();
+        self.store
+            .store_session(&session_id, &session)
+            .await
+            .map_err(|_| LoginError::Unavailable)?;
+        let login_audit = match &session.subject {
+            SessionSubject::Admin { admin_user_id, .. } => {
+                Some(self.auth_audit("admin.login", admin_user_id))
+            }
+            SessionSubject::User { user_id, .. } => {
+                let mut audit = self.auth_audit("user.login", user_id);
+                audit.actor_kind = crate::model::auth::AuditActorKind::UserSession;
+                audit.actor_admin_user_id = None;
+                audit.actor_ref = format!("user:{user_id}");
+                audit.entity_kind = "user".to_owned();
+                Some(audit)
+            }
+            SessionSubject::Key { .. } => None,
+        };
+        if let Some(audit) = login_audit
+            && self.store.append_audit_event(audit).await.is_err()
+        {
+            let _ = self.store.delete_session(&session_id).await;
+            return Err(LoginError::Unavailable);
+        }
+        if let Some(previous) = previous_session_id.filter(|value| !value.is_empty())
+            && self.logout(previous).await.is_err()
+        {
+            let _ = self.store.delete_session(&session_id).await;
+            return Err(LoginError::Unavailable);
+        }
+        Ok(LoginResult {
+            session_id,
+            session,
+        })
     }
 }
 
@@ -180,14 +300,23 @@ impl AuthService for DefaultAuthService {
                 "尝试过于频繁，请稍后再试",
             ));
         }
-        validate_new_password(&command.new_password)?;
-        let password_hash = self
+        super::password::validate_password(&command.new_password)?;
+        let credential = self
             .store
-            .load_password_hash(&admin_user_id)
+            .load_user_by_id(&admin_user_id)
             .await
             .map_err(|error| map_store_error(error, "administrator"))?
-            .filter(|hash| password_fingerprint(hash) == credential_fingerprint)
+            .filter(|credential| {
+                credential.user.enabled
+                    && credential.user.role == UserRole::Admin
+                    && session_fingerprint_matches(
+                        &credential_fingerprint,
+                        &credential.password_hash,
+                        credential.user.session_version,
+                    )
+            })
             .ok_or_else(|| AdminError::conflict("密码已变更，请重新登录"))?;
+        let password_hash = credential.password_hash;
         if command.current_password.len() > 4096
             || !verify_admin_password(&command.current_password, &password_hash)?
         {
@@ -236,19 +365,22 @@ impl AuthService for DefaultAuthService {
             let _ = self.store.delete_session(session_id).await;
             return Ok(None);
         }
-        if let SessionSubject::Admin {
-            admin_user_id,
-            credential_fingerprint,
-        } = &session.subject
-        {
-            let password_hash = self
+        if let Some((user_id, role, fingerprint)) = session_user_binding(&session.subject) {
+            let credential = self
                 .store
-                .load_password_hash(admin_user_id)
+                .load_user_by_id(user_id)
                 .await
-                .map_err(|error| map_store_error(error, "administrator session"))?;
-            if password_hash
-                .is_none_or(|hash| password_fingerprint(&hash) != *credential_fingerprint)
-            {
+                .map_err(|error| map_store_error(error, "user session"))?;
+            let valid = credential.as_ref().is_some_and(|credential| {
+                credential.user.enabled
+                    && credential.user.role == role
+                    && session_fingerprint_matches(
+                        fingerprint,
+                        &credential.password_hash,
+                        credential.user.session_version,
+                    )
+            });
+            if !valid {
                 let _ = self.store.delete_session(session_id).await;
                 return Ok(None);
             }
@@ -276,12 +408,32 @@ impl AuthService for DefaultAuthService {
             .map(|session| session.subject)
         {
             Some(SessionSubject::Admin { admin_user_id, .. }) => Ok(Some(admin_user_id)),
-            Some(SessionSubject::Key { .. }) => Err(AdminError::new(
-                AdminErrorKind::Forbidden,
-                "当前身份无权访问管理接口",
-            )),
+            Some(SessionSubject::User { .. }) | Some(SessionSubject::Key { .. }) => Err(
+                AdminError::new(AdminErrorKind::Forbidden, "当前身份无权访问管理接口"),
+            ),
             None => Ok(None),
         }
+    }
+
+    async fn resolve_user(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Option<UserRecord>, AdminError> {
+        let Some(session) = self.session(session_id).await? else {
+            return Ok(None);
+        };
+        let user_id = match session.subject {
+            SessionSubject::Admin { admin_user_id, .. } => admin_user_id,
+            SessionSubject::User { user_id, .. } => user_id,
+            SessionSubject::Key { .. } => return Ok(None),
+        };
+        Ok(self
+            .store
+            .load_user_by_id(&user_id)
+            .await
+            .map_err(|error| map_store_error(error, "user identity"))?
+            .map(|record| record.user)
+            .filter(|user| user.enabled))
     }
 
     async fn verify_admin_api_key(&self, key: &str) -> Result<bool, AdminError> {
@@ -305,56 +457,28 @@ impl AuthService for DefaultAuthService {
         source_ip: IpAddr,
         previous_session_id: Option<&str>,
     ) -> Result<LoginResult, LoginError> {
-        if let Some(retry_after) = self
-            .store
-            .consume_login_attempt(
-                source_ip,
-                LOGIN_ATTEMPTS_PER_SOURCE,
-                LOGIN_ATTEMPTS_GLOBAL,
-                LOGIN_WINDOW,
-            )
+        // 便捷入口不绕过登录防护；启用Turnstile时无证明必须拒绝。
+        self.login_inner(
+            command,
+            source_ip,
+            previous_session_id,
+            LoginProtectionProof {
+                token: None,
+                remote_ip: Some(source_ip),
+            },
+        )
+        .await
+    }
+
+    async fn login_with_protection(
+        &self,
+        command: LoginCommand,
+        protection: LoginProtectionProof,
+        previous_session_id: Option<&str>,
+    ) -> Result<LoginResult, LoginError> {
+        let source_ip = protection.remote_ip.ok_or(LoginError::Unavailable)?;
+        self.login_inner(command, source_ip, previous_session_id, protection)
             .await
-            .map_err(|_| LoginError::Unavailable)?
-        {
-            return Err(LoginError::TooManyAttempts {
-                retry_after_seconds: retry_after.as_secs().max(1),
-            });
-        }
-        let subject = self.authenticate(command).await?;
-        let ttl = match subject {
-            SessionSubject::Admin { .. } => self.admin_session_ttl,
-            SessionSubject::Key { .. } => self.key_session_ttl,
-        };
-        let session = AuthSession {
-            subject,
-            expires_at: Utc::now() + ttl,
-        };
-        let session_id = random_session_token();
-        self.store
-            .store_session(&session_id, &session)
-            .await
-            .map_err(|_| LoginError::Unavailable)?;
-        if let SessionSubject::Admin { admin_user_id, .. } = &session.subject
-            && self
-                .store
-                .append_audit_event(self.auth_audit("admin.login", admin_user_id))
-                .await
-                .is_err()
-        {
-            let _ = self.store.delete_session(&session_id).await;
-            return Err(LoginError::Unavailable);
-        }
-        // 新身份验证成功后才撤销旧会话；撤销失败时不向浏览器提交新会话。
-        if let Some(previous) = previous_session_id.filter(|value| !value.is_empty())
-            && self.logout(previous).await.is_err()
-        {
-            let _ = self.store.delete_session(&session_id).await;
-            return Err(LoginError::Unavailable);
-        }
-        Ok(LoginResult {
-            session_id,
-            session,
-        })
     }
 
     async fn logout(&self, session_id: &str) -> Result<(), AdminError> {
@@ -375,6 +499,18 @@ impl AuthService for DefaultAuthService {
         }
         Ok(())
     }
+
+    async fn public_auth_settings(&self) -> Result<PublicAuthSettings, AdminError> {
+        let settings = self
+            .store
+            .load_turnstile_settings()
+            .await
+            .map_err(|error| map_store_error(error, "auth settings"))?;
+        Ok(PublicAuthSettings {
+            turnstile_enabled: settings.enabled,
+            turnstile_site_key: settings.site_key,
+        })
+    }
 }
 
 fn session_ttl(minutes: u64) -> Duration {
@@ -383,19 +519,6 @@ fn session_ttl(minutes: u64) -> Duration {
             .unwrap_or(MAX_SESSION_TTL_MINUTES)
             .clamp(1, MAX_SESSION_TTL_MINUTES),
     )
-}
-
-fn validate_new_password(password: &str) -> Result<(), AdminError> {
-    if password.trim().chars().count() < 12
-        || password.len() > 1024
-        || password.chars().any(char::is_control)
-        || crate::WEAK_ADMIN_PASSWORDS.contains(&password.trim().to_ascii_lowercase().as_str())
-    {
-        return Err(AdminError::invalid(
-            "新密码至少需要 12 个字符，最多 1024 字节，不能使用常见弱口令或控制字符",
-        ));
-    }
-    Ok(())
 }
 
 fn hash_admin_password(password: &str) -> Result<String, AdminError> {
@@ -428,4 +551,30 @@ fn valid_admin_api_key_shape(value: &str) -> bool {
 // 指纹只绑定已加盐的密码哈希，不把密码或原始哈希复制到 Redis 会话。
 fn password_fingerprint(password_hash: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(password_hash.as_bytes()))
+}
+
+pub(super) fn session_fingerprint(password_hash: &str, session_version: u64) -> String {
+    format!("{}:{session_version}", password_fingerprint(password_hash))
+}
+
+fn session_fingerprint_matches(
+    fingerprint: &str,
+    password_hash: &str,
+    session_version: u64,
+) -> bool {
+    fingerprint == session_fingerprint(password_hash, session_version)
+}
+
+pub(super) fn session_user_binding(subject: &SessionSubject) -> Option<(&str, UserRole, &str)> {
+    match subject {
+        SessionSubject::Admin {
+            admin_user_id,
+            credential_fingerprint,
+        } => Some((admin_user_id, UserRole::Admin, credential_fingerprint)),
+        SessionSubject::User {
+            user_id,
+            credential_fingerprint,
+        } => Some((user_id, UserRole::User, credential_fingerprint)),
+        SessionSubject::Key { .. } => None,
+    }
 }

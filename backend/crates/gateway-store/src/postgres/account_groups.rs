@@ -362,6 +362,9 @@ impl AccountGroupStore for PgAccountGroupRepository {
                          where g.id = $1
                            and not exists (
                              select 1 from client_api_key_groups k where k.account_group_id = g.id
+                           )
+                           and not exists (
+                             select 1 from user_account_groups ug where ug.account_group_id = g.id
                            )",
                     )
                     .bind(command.id.as_str())
@@ -399,6 +402,7 @@ fn group_select() -> QueryBuilder<Postgres> {
         "select g.id, g.name, g.description, g.color, g.enabled, g.disable_fast, g.created_at, g.updated_at,
                 coalesce(members.member_count, 0)::bigint as member_count,
                 coalesce(keys.client_key_count, 0)::bigint as client_key_count,
+                coalesce(users.user_count, 0)::bigint as user_count,
                 coalesce(members.provider_counts, '{}'::jsonb) as provider_counts
          from account_groups g
          left join lateral (
@@ -418,6 +422,11 @@ fn group_select() -> QueryBuilder<Postgres> {
            from client_api_key_groups kg
            where kg.account_group_id = g.id
          ) keys on true
+         left join lateral (
+           select count(*)::bigint as user_count
+           from user_account_groups ug
+           where ug.account_group_id = g.id
+         ) users on true
          where true",
     )
 }
@@ -497,6 +506,7 @@ fn group_record(row: &sqlx::postgres::PgRow) -> StoreResult<AccountGroupRecord> 
         member_count: count_value(row, "member_count")?,
         provider_counts,
         client_key_count: count_value(row, "client_key_count")?,
+        user_count: count_value(row, "user_count")?,
         account_summary: AccountGroupAccountSummary {
             available: 0,
             limited: 0,

@@ -1,7 +1,6 @@
 mod account_groups;
 mod accounts;
 mod auth;
-mod auth_key;
 mod backup;
 mod client_keys;
 mod freeze_recovery;
@@ -21,6 +20,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
+use gateway_admin::ports::auth::{TurnstileVerifier, TurnstileVerifyError};
 use gateway_admin::{
     AdminConfig, AdminServices, ClientConfig, InitialAdminPassword,
     model::{
@@ -56,6 +56,7 @@ use gateway_admin::{
         },
         settings::{AdminApiKey, AdminApiKeyMutation, ReplaceRuntimeSettings, RuntimeSettings},
         system::{SystemOperationAccepted, SystemUpdateDetail, SystemUpdateStatus, SystemVersion},
+        users::{UserCredentialRecord, UserRecord, UserRole},
     },
     ports::{
         backup::BackupStorePorts,
@@ -72,6 +73,20 @@ use gateway_admin::{
         },
     },
 };
+
+struct NoopTurnstile;
+
+#[async_trait]
+impl TurnstileVerifier for NoopTurnstile {
+    async fn verify(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<std::net::IpAddr>,
+    ) -> Result<bool, TurnstileVerifyError> {
+        Ok(true)
+    }
+}
 use gateway_core::{
     account::ProviderAccountId,
     engine::{
@@ -80,6 +95,7 @@ use gateway_core::{
     },
     error::{GatewayError, GatewayErrorKind},
     policy::ClientApiKeyId,
+    policy::UserRateLimits,
     routing::{ConfigRevision, ProviderKind},
     runtime::SnapshotControl,
 };
@@ -165,16 +181,6 @@ impl AdminHarness {
         self
     }
 
-    pub(super) fn client_session_ttl_minutes(mut self, minutes: u64) -> Self {
-        self.client_session_ttl_minutes = minutes;
-        self
-    }
-
-    pub(super) fn client_key_verifier(mut self, verifier: Arc<dyn ClientKeyVerifier>) -> Self {
-        self.client_key_verifier = verifier;
-        self
-    }
-
     pub(super) fn observability(mut self, store: Arc<dyn ObservabilityStore>) -> Self {
         self.observability = store;
         self
@@ -251,6 +257,7 @@ impl AdminHarness {
                 client_distribution: Arc::new(NoopClientDistribution),
                 system: self.system,
                 client_key_verifier: self.client_key_verifier,
+                turnstile: Arc::new(NoopTurnstile),
             },
         )
         .await
@@ -279,6 +286,40 @@ struct BootstrapAuthStore {
 
 #[async_trait]
 impl AuthStore for BootstrapAuthStore {
+    async fn load_user_by_username(
+        &self,
+        username: &str,
+    ) -> AdminStoreResult<Option<UserCredentialRecord>> {
+        if username != "admin" {
+            return Ok(None);
+        }
+        Ok(self
+            .password_hash
+            .lock()
+            .expect("password hash")
+            .clone()
+            .map(|password_hash| UserCredentialRecord {
+                user: UserRecord {
+                    id: "admin".to_owned(),
+                    username: "admin".to_owned(),
+                    role: UserRole::Admin,
+                    enabled: true,
+                    limits: UserRateLimits::default(),
+                    session_version: 1,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                password_hash,
+            }))
+    }
+
+    async fn load_user_by_id(
+        &self,
+        user_id: &str,
+    ) -> AdminStoreResult<Option<UserCredentialRecord>> {
+        self.load_user_by_username(user_id).await
+    }
+
     async fn load_password_hash(&self, _: &str) -> AdminStoreResult<Option<String>> {
         Ok(self.password_hash.lock().expect("password hash").clone())
     }

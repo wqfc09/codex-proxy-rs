@@ -103,6 +103,7 @@ impl OtherRequestOutcome {
 /// 用量记录过滤条件。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageFilter {
+    pub user_id: Option<String>,
     pub client_api_key_ref: Option<String>,
     pub request_id: Option<String>,
     pub provider_account_ref: Option<String>,
@@ -130,6 +131,7 @@ pub struct UsageQuery {
 /// 运维错误过滤条件。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpsErrorFilter {
+    pub user_id: Option<String>,
     pub client_api_key_ref: Option<String>,
     pub request_id: Option<String>,
     pub provider_kind: Option<String>,
@@ -547,6 +549,8 @@ pub struct DashboardObservation {
 /// 使用记录表格的窄读模型。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageListRecord {
+    pub user_id: Option<String>,
+    pub username: Option<String>,
     pub client_api_key_name: Option<String>,
     pub id: String,
     pub endpoint: String,
@@ -601,6 +605,8 @@ pub struct UsageListRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageRecord {
     pub id: String,
+    pub user_id: Option<String>,
+    pub username: Option<String>,
     pub client_api_key_ref: String,
     pub config_revision: u64,
     pub routing_scope: String,
@@ -683,6 +689,106 @@ pub struct UsagePage {
     pub current_page: u32,
     pub page_size: u16,
     pub total: u64,
+}
+
+/// 普通用户 Usage 允许的过滤条件；用户身份由会话注入，客户端不能指定。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserUsageFilter {
+    pub client_api_key_ref: Option<String>,
+    pub model: Option<String>,
+    pub outcome: Option<RequestOutcome>,
+    pub status_code: Option<u16>,
+}
+
+/// 普通用户 Usage 分页查询。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserUsageQuery {
+    pub range: TimeRange,
+    pub filter: UserUsageFilter,
+    pub current_page: u32,
+    pub page_size: PageSize,
+}
+
+/// 普通用户可读取的请求历史窄投影。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserUsageRecord {
+    pub id: String,
+    pub client_api_key_ref: String,
+    pub client_api_key_name: String,
+    pub operation: String,
+    pub request_kind: Option<String>,
+    pub requested_model_id: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub image_input_tokens: Option<u64>,
+    pub image_output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub image_requested_size: Option<String>,
+    pub image_requested_count: Option<u64>,
+    pub image_output_size: Option<String>,
+    pub image_count: Option<u64>,
+    pub image_billing_tier: Option<String>,
+    pub downstream_rate_multiplier: Option<DecimalAmount>,
+    pub downstream_billed_amount: Option<DecimalAmount>,
+    pub outcome: RequestOutcome,
+    pub client_status_code: Option<u16>,
+    pub latency_ms: Option<u64>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserUsagePage {
+    pub items: Vec<UserUsageRecord>,
+    pub current_page: u32,
+    pub page_size: u16,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserUsageDailyPoint {
+    pub bucket_start: DateTime<Utc>,
+    pub request_count: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub total_tokens: u64,
+    pub billed_usd: Option<DecimalAmount>,
+    pub billed_known_count: u64,
+    pub billed_unknown_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserUsageBreakdown {
+    pub id: Option<String>,
+    pub name: String,
+    pub request_count: u64,
+    pub total_tokens: u64,
+    pub is_other: bool,
+}
+
+/// 普通用户汇总只暴露 downstream billed amount，不暴露 Provider 成本或诊断信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserUsageSummary {
+    pub range: TimeRange,
+    pub request_count: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub total_tokens: u64,
+    pub billed_usd: Option<DecimalAmount>,
+    pub billed_known_count: u64,
+    pub billed_unknown_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub average_latency_ms: Option<u64>,
+    pub trend_granularity: &'static str,
+    pub trend: Vec<UserUsageDailyPoint>,
+    pub daily: Vec<UserUsageDailyPoint>,
+    pub models: Vec<UserUsageBreakdown>,
+    pub client_keys: Vec<UserUsageBreakdown>,
 }
 
 /// 请求中的一次上游尝试或运维事件。

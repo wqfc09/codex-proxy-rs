@@ -32,6 +32,7 @@ fn client_admission_startup_recovery_should_preserve_order_and_exact_facts() {
                 model_request_id: request,
                 expires_at: now + Duration::from_secs(30),
             }],
+            user: None,
         };
         let recoveries = ScriptedRecoveries::new(Ok(vec![recovery.clone()]));
         let admissions = RecordingAdmissions::default();
@@ -99,6 +100,7 @@ fn empty_recovery() -> ClientAdmissionRecovery {
         client_api_key_id: ClientApiKeyId::new("key_empty").expect("key id"),
         recent_requests: Vec::new(),
         running_requests: Vec::new(),
+        user: None,
     }
 }
 

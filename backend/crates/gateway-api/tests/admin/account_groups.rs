@@ -34,6 +34,7 @@ async fn list_route_should_keep_camel_case_group_and_page_wire() {
     assert_eq!(value["data"]["items"][0]["memberCount"], 2);
     assert_eq!(value["data"]["items"][0]["providerCounts"]["openai"], 1);
     assert_eq!(value["data"]["items"][0]["clientKeyCount"], 2);
+    assert_eq!(value["data"]["items"][0]["userCount"], 1);
     assert_eq!(value["data"]["items"][0]["accountSummary"]["available"], 1);
     assert_eq!(value["data"]["items"][0]["accountSummary"]["limited"], 1);
     assert_eq!(value["data"]["items"][0]["accountSummary"]["total"], 2);

@@ -294,6 +294,10 @@ impl AdminError {
         Self::from_spec(SESSION_REQUIRED)
     }
 
+    pub fn user_session_required() -> Self {
+        Self::session_required()
+    }
+
     pub fn invalid_credentials() -> Self {
         Self::from_spec(INVALID_CREDENTIALS)
     }

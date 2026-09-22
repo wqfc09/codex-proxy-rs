@@ -4,9 +4,10 @@ use axum::{
     response::Response,
 };
 use chrono::{Duration, Utc};
+use gateway_admin::model::client_keys::ClientKeyRecord;
 use gateway_core::{
     engine::budget::{ClientBudgetLimits, ClientBudgetStatus},
-    policy::ClientApiKeyId,
+    policy::{ClientApiKeyId, RateLimits},
 };
 use serde_json::json;
 use tower::ServiceExt as _;
@@ -21,24 +22,31 @@ const KEY: &str = RAW_KEY;
 async fn fixture() -> (AdminTestFixture, Router) {
     let fixture = key_fixture().await;
     let id = ClientApiKeyId::new("key-42").unwrap();
-    let mut key = fixture
-        .services
-        .client_keys()
-        .reveal(&id)
-        .await
-        .unwrap()
-        .record;
-    key.id = id;
-    key.label = Some("private-usage-sentinel".to_owned());
-    key.budget = ClientBudgetStatus {
-        limits: ClientBudgetLimits {
-            daily_usd: "1".parse().unwrap(),
-            weekly_usd: "5".parse().unwrap(),
+    let now = Utc::now();
+    let key = ClientKeyRecord {
+        openai_client_profile_override: None,
+        xai_client_profile_override: None,
+        id,
+        name: "Development".to_owned(),
+        label: Some("private-usage-sentinel".to_owned()),
+        groups: Vec::new(),
+        provider_kinds: Vec::new(),
+        prefix: "cpr_live".to_owned(),
+        enabled: true,
+        limits: RateLimits::unlimited(),
+        budget: ClientBudgetStatus {
+            limits: ClientBudgetLimits {
+                daily_usd: "1".parse().unwrap(),
+                weekly_usd: "5".parse().unwrap(),
+            },
+            daily_used_usd: "0.6400000001".parse().unwrap(),
+            weekly_used_usd: "2.35".parse().unwrap(),
+            daily_resets_at: Some((Utc::now() + Duration::days(1)).into()),
+            weekly_resets_at: Some((now + Duration::days(7)).into()),
         },
-        daily_used_usd: "0.6400000001".parse().unwrap(),
-        weekly_used_usd: "2.35".parse().unwrap(),
-        daily_resets_at: Some((Utc::now() + Duration::days(1)).into()),
-        weekly_resets_at: Some((Utc::now() + Duration::days(7)).into()),
+        last_used_at: None,
+        created_at: now,
+        updated_at: now,
     };
     *fixture.client_key.lock().unwrap() = Some(key);
     let app = super::api_router_with_admin(fixture.services.clone());
@@ -76,6 +84,10 @@ async fn usage_returns_current_key_budget_without_exposing_private_data_or_writi
                 "total": "5", "used": "2.35", "remaining": "2.65",
                 "resetsAt": before.budget.weekly_resets_at.map(chrono::DateTime::<Utc>::from),
             },
+            "available": {
+                "remaining": "0.3599999999",
+                "resetsAt": before.budget.daily_resets_at.map(chrono::DateTime::<Utc>::from),
+            },
         })
     );
     assert!(!body.to_string().contains("private-usage-sentinel"));
@@ -98,6 +110,7 @@ async fn usage_remains_readable_when_exhausted_and_never_returns_negative_remain
     assert_eq!(body["daily"]["remaining"], "0");
     assert_eq!(body["weekly"]["remaining"], "0");
     assert_eq!(body["weekly"]["used"], "5.75");
+    assert_eq!(body["available"]["remaining"], "0");
 }
 
 #[tokio::test]
@@ -125,6 +138,13 @@ async fn usage_distinguishes_unlimited_and_unused_windows_from_exhausted_budgets
                 })
             );
         }
+        let expected_available = match (daily, weekly) {
+            ("0", "0") => None,
+            ("0", weekly) => Some(weekly),
+            (daily, "0") => Some(daily),
+            (daily, weekly) => Some(if daily <= weekly { daily } else { weekly }),
+        };
+        assert_eq!(body["available"]["remaining"], json!(expected_available));
     }
 }
 

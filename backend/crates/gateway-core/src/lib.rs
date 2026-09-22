@@ -5,6 +5,7 @@
 
 pub mod account;
 pub mod concurrency;
+mod decimal;
 pub mod diagnostics;
 pub mod engine;
 pub mod error;

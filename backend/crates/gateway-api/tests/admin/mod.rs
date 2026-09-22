@@ -9,6 +9,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use futures::future::BoxFuture;
+use gateway_admin::ports::auth::{TurnstileVerifier, TurnstileVerifyError};
 use gateway_admin::{
     AdminConfig, AdminServices, ClientConfig, InitialAdminPassword,
     model::{
@@ -51,6 +52,7 @@ use gateway_admin::{
             RotationStrategy, RuntimeSettings,
         },
         system::{SystemOperationAccepted, SystemUpdateDetail, SystemUpdateStatus, SystemVersion},
+        users::{TurnstileSettings, UserCredentialRecord, UserRecord, UserRole},
     },
     ports::{
         client_distribution::ClientDistributionResolver,
@@ -66,6 +68,20 @@ use gateway_admin::{
         },
     },
 };
+
+struct NoopTurnstile;
+
+#[async_trait]
+impl TurnstileVerifier for NoopTurnstile {
+    async fn verify(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<std::net::IpAddr>,
+    ) -> Result<bool, TurnstileVerifyError> {
+        Ok(true)
+    }
+}
 use gateway_api::auth::SessionState;
 use gateway_core::{
     account::{AccountStatusFacts, CredentialState, ProviderAccountId, QuotaState},
@@ -73,7 +89,7 @@ use gateway_core::{
         execution::{ClientAuthenticationError, ClientKeyVerifier},
         probe::{AccountProbe, AccountProbeError, AccountProbeRequest, AccountProbeResult},
     },
-    policy::{ClientApiKeyId, RateLimits},
+    policy::{ClientApiKeyId, RateLimits, UserRateLimits},
     routing::{ConfigRevision, ProviderKind, PublicModelId, UpstreamModelId},
     runtime::SnapshotControl,
 };
@@ -81,12 +97,13 @@ use gateway_core::{
 mod account_groups;
 mod accounts;
 mod auth;
-mod client_keys;
 mod errors;
 mod observability;
 mod proxies;
 mod settings;
+mod subscription_billing;
 mod system;
+mod users;
 mod wire;
 
 pub(super) struct AdminTestFixture {
@@ -184,6 +201,7 @@ impl AdminTestFixture {
                 client_distribution: Arc::new(StaticClientDistribution),
                 system,
                 client_key_verifier: verifier.unwrap_or_else(|| Arc::new(UnusedClientKeyVerifier)),
+                turnstile: Arc::new(NoopTurnstile),
             },
         )
         .await
@@ -247,6 +265,7 @@ pub(super) struct MemoryAuthStore {
     pub(super) enabled: AtomicBool,
     pub(super) unavailable: AtomicBool,
     password_hash: Mutex<Option<String>>,
+    users: Mutex<BTreeMap<String, UserCredentialRecord>>,
     sessions: Mutex<BTreeMap<String, AuthSession>>,
     audits: Mutex<Vec<AdminAuditEvent>>,
     api_key: Arc<Mutex<Option<AdminApiKey>>>,
@@ -259,6 +278,7 @@ impl MemoryAuthStore {
             enabled: AtomicBool::new(false),
             unavailable: AtomicBool::new(false),
             password_hash: Mutex::new(None),
+            users: Mutex::new(BTreeMap::new()),
             sessions: Mutex::new(BTreeMap::new()),
             audits: Mutex::new(Vec::new()),
             api_key,
@@ -274,7 +294,7 @@ impl MemoryAuthStore {
                     credential_fingerprint: {
                         use base64::Engine as _;
                         use sha2::Digest as _;
-                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                        let digest = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
                             sha2::Sha256::digest(
                                 self.password_hash
                                     .lock()
@@ -283,7 +303,8 @@ impl MemoryAuthStore {
                                     .unwrap()
                                     .as_bytes(),
                             ),
-                        )
+                        );
+                        format!("{digest}:1")
                     },
                     admin_user_id: "admin_1".to_owned(),
                 },
@@ -292,8 +313,48 @@ impl MemoryAuthStore {
         );
     }
 
+    /// 为历史只读用例显式注入兼容 Key 会话；浏览器登录不会创建这种会话。
+    pub fn insert_legacy_key_session(&self, session_id: &str) {
+        self.sessions.lock().expect("sessions").insert(
+            session_id.to_owned(),
+            AuthSession {
+                subject: gateway_admin::model::auth::SessionSubject::Key {
+                    client_key_id: gateway_core::policy::ClientApiKeyId::new("key-42")
+                        .expect("key ID"),
+                },
+                expires_at: Utc::now() + Duration::hours(1),
+            },
+        );
+    }
+
     pub fn set_api_key(&self, value: &str) {
         *self.api_key.lock().expect("API key") = Some(AdminApiKey::new(value));
+    }
+
+    pub fn insert_user(&self, id: &str, username: &str, role: UserRole) {
+        let password_hash = self
+            .password_hash
+            .lock()
+            .expect("password hash")
+            .clone()
+            .expect("bootstrap password");
+        let now = Utc::now();
+        self.users.lock().expect("users").insert(
+            id.to_owned(),
+            UserCredentialRecord {
+                user: UserRecord {
+                    id: id.to_owned(),
+                    username: username.to_owned(),
+                    role,
+                    enabled: true,
+                    limits: UserRateLimits::default(),
+                    session_version: 1,
+                    created_at: now,
+                    updated_at: now,
+                },
+                password_hash,
+            },
+        );
     }
 
     pub fn fail_audit(&self, fail: bool) {
@@ -311,6 +372,106 @@ impl MemoryAuthStore {
 
 #[async_trait]
 impl AuthStore for MemoryAuthStore {
+    async fn create_user(
+        &self,
+        record: UserCredentialRecord,
+        _: &MutationContext,
+    ) -> AdminStoreResult<UserRecord> {
+        let user = record.user.clone();
+        self.users.lock().unwrap().insert(user.id.clone(), record);
+        Ok(user)
+    }
+
+    async fn update_user(
+        &self,
+        command: &gateway_admin::model::users::UpdateUser,
+        _: &MutationContext,
+    ) -> AdminStoreResult<(Revision, UserRecord)> {
+        let mut users = self.users.lock().unwrap();
+        let record = users.get_mut(&command.user_id).expect("test user exists");
+        if let Some(value) = command.max_concurrency {
+            record.user.limits.max_concurrency = value;
+        }
+        if let Some(value) = command.requests_per_minute {
+            record.user.limits.requests_per_minute = value;
+        }
+        Ok((Revision::new(2).unwrap(), record.user.clone()))
+    }
+
+    async fn bump_user_session_version(
+        &self,
+        user_id: &str,
+        _: &MutationContext,
+    ) -> AdminStoreResult<UserRecord> {
+        let mut users = self.users.lock().unwrap();
+        let record = users.get_mut(user_id).expect("test user exists");
+        record.user.session_version += 1;
+        Ok(record.user.clone())
+    }
+
+    async fn load_turnstile_settings(&self) -> AdminStoreResult<TurnstileSettings> {
+        Ok(TurnstileSettings::default())
+    }
+
+    async fn load_user_key_identity(
+        &self,
+        _user_id: &str,
+    ) -> AdminStoreResult<gateway_admin::model::users::UserKeyIdentity> {
+        Ok(gateway_admin::model::users::UserKeyIdentity::default())
+    }
+
+    async fn replace_user_key_identity(
+        &self,
+        _user_id: &str,
+        _identity: gateway_admin::model::users::UserKeyIdentity,
+        _: &MutationContext,
+    ) -> AdminStoreResult<Revision> {
+        Ok(Revision::new(2).expect("revision"))
+    }
+
+    async fn load_user_by_username(
+        &self,
+        username: &str,
+    ) -> AdminStoreResult<Option<UserCredentialRecord>> {
+        if username == "admin_1" {
+            return Ok(self
+                .password_hash
+                .lock()
+                .expect("password hash")
+                .clone()
+                .map(|password_hash| UserCredentialRecord {
+                    user: UserRecord {
+                        id: "admin_1".to_owned(),
+                        username: "admin_1".to_owned(),
+                        role: UserRole::Admin,
+                        enabled: true,
+                        limits: UserRateLimits::default(),
+                        session_version: 1,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                    },
+                    password_hash,
+                }));
+        }
+        Ok(self
+            .users
+            .lock()
+            .expect("users")
+            .values()
+            .find(|record| record.user.username == username)
+            .cloned())
+    }
+
+    async fn load_user_by_id(
+        &self,
+        user_id: &str,
+    ) -> AdminStoreResult<Option<UserCredentialRecord>> {
+        if user_id == "admin_1" {
+            return self.load_user_by_username(user_id).await;
+        }
+        Ok(self.users.lock().expect("users").get(user_id).cloned())
+    }
+
     async fn load_password_hash(&self, _: &str) -> AdminStoreResult<Option<String>> {
         Ok(self.password_hash.lock().expect("password hash").clone())
     }
@@ -334,6 +495,34 @@ impl AuthStore for MemoryAuthStore {
         };
         *credentials = password_hash.to_owned();
         self.audits.lock().unwrap().push(audit);
+        Ok(true)
+    }
+
+    async fn update_user_password_hash_if_matches(
+        &self,
+        user_id: &str,
+        expected_hash: &str,
+        password_hash: &str,
+    ) -> AdminStoreResult<bool> {
+        if user_id == "admin_1" {
+            let mut stored = self.password_hash.lock().expect("password hash");
+            let Some(current) = stored
+                .as_mut()
+                .filter(|value| value.as_str() == expected_hash)
+            else {
+                return Ok(false);
+            };
+            *current = password_hash.to_owned();
+            return Ok(true);
+        }
+        let mut users = self.users.lock().expect("users");
+        let Some(record) = users
+            .get_mut(user_id)
+            .filter(|record| record.password_hash == expected_hash)
+        else {
+            return Ok(false);
+        };
+        record.password_hash = password_hash.to_owned();
         Ok(true)
     }
 
@@ -624,6 +813,7 @@ impl MemoryAccountGroupStore {
                         ("xai".to_owned(), 1),
                     ]),
                     client_key_count: 2,
+                    user_count: 1,
                     account_summary: account_summary(1, 1, 2),
                     capacity: capacity(Some(0), 1),
                     usage: usage("1.25", "5.5"),
@@ -643,6 +833,7 @@ impl MemoryAccountGroupStore {
                     member_count: 0,
                     provider_counts: BTreeMap::new(),
                     client_key_count: 0,
+                    user_count: 0,
                     account_summary: account_summary(0, 0, 0),
                     capacity: capacity(Some(0), 0),
                     usage: usage("0", "0"),
@@ -759,6 +950,7 @@ impl AccountGroupStore for MemoryAccountGroupStore {
             member_count: 0,
             provider_counts: BTreeMap::new(),
             client_key_count: 0,
+            user_count: 0,
             account_summary: account_summary(0, 0, 0),
             capacity: capacity(Some(0), 0),
             usage: usage("0", "0"),
@@ -836,6 +1028,83 @@ fn mutation(
 
 #[async_trait]
 impl ClientKeyStore for MemoryClientKeyStore {
+    async fn list_user_client_keys(
+        &self,
+        user_id: &str,
+        _query: ClientKeyListQuery,
+    ) -> AdminStoreResult<ClientKeyPage> {
+        assert_eq!(user_id, "admin_1");
+        let items: Vec<_> = self
+            .0
+            .lock()
+            .expect("client key")
+            .clone()
+            .into_iter()
+            .collect();
+        Ok(ClientKeyPage {
+            config_revision: Revision::new(1).expect("revision"),
+            total: items.len() as u64,
+            items,
+            next_cursor: None,
+        })
+    }
+    async fn replace_user_client_key_identity(
+        &self,
+        user_id: &str,
+        command: gateway_admin::model::client_keys::ReplaceClientKeyIdentity,
+        _: &MutationContext,
+    ) -> AdminStoreResult<(Revision, ClientKeyRecord)> {
+        if user_id != "admin_1" {
+            return Err(AdminStoreError::new(
+                AdminStoreErrorKind::NotFound,
+                "client key",
+                "missing owned key",
+            ));
+        }
+        let mut state = self.0.lock().expect("client key");
+        let record = state
+            .as_mut()
+            .filter(|record| record.id == command.id)
+            .ok_or_else(|| {
+                AdminStoreError::new(AdminStoreErrorKind::NotFound, "client key", "missing key")
+            })?;
+        record.openai_client_profile_override = command.openai_client_profile_override;
+        record.xai_client_profile_override = command.xai_client_profile_override;
+        Ok((Revision::new(2).expect("revision"), record.clone()))
+    }
+
+    async fn reveal_user_client_key(
+        &self,
+        user_id: &str,
+        id: &ClientApiKeyId,
+    ) -> AdminStoreResult<Option<ClientKeySecret>> {
+        if user_id != "admin_1" {
+            return Ok(None);
+        }
+        self.reveal_client_key(id).await
+    }
+    async fn reset_user_client_key_budget(
+        &self,
+        user_id: &str,
+        command: gateway_admin::model::client_keys::ResetClientKeyBudget,
+    ) -> AdminStoreResult<()> {
+        if user_id != "admin_1" {
+            return Err(AdminStoreError::new(
+                AdminStoreErrorKind::NotFound,
+                "client key",
+                "missing owned key",
+            ));
+        }
+        self.reset_client_key_budget(
+            command,
+            &MutationContext {
+                actor: gateway_admin::model::MutationActor::System,
+                request_id: "test_owner_reset".to_owned(),
+            },
+        )
+        .await
+    }
+
     async fn reset_client_key_budget(
         &self,
         command: gateway_admin::model::client_keys::ResetClientKeyBudget,

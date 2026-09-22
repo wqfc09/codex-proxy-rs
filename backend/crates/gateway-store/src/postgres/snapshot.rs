@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use gateway_core::account::ProviderAccountId;
+use gateway_core::metering::Decimal;
+use gateway_core::policy::{ClientBillingPolicy, UserBudgetLimits, UserId, UserRateLimits};
 use gateway_core::routing::{
     AccountGroupId, ConfigRevision,
     snapshot::{
@@ -48,6 +50,52 @@ pub struct RuntimeSnapshotData {
     pub account_groups: Vec<SnapshotAccountGroupData>,
     pub provider_accounts: Vec<SnapshotProviderAccountData>,
     pub group_memberships: Vec<SnapshotGroupMembershipData>,
+    pub user_runtime: Vec<SnapshotUserRuntimeData>,
+    pub client_key_owners: BTreeMap<String, SnapshotClientKeyOwner>,
+    pub client_key_metadata: BTreeMap<String, SnapshotClientKeyMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotClientKeyOwner {
+    Ownerless,
+    Owned(String),
+    Suppressed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotClientKeyMetadata {
+    pub username_snapshot: Option<String>,
+    pub client_api_key_name_snapshot: Option<String>,
+}
+
+/// 0017 用户事实单独读取，避免改变旧 `ClientApiKeySnapshot` 合同。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotUserRuntimeData {
+    pub key_id: String,
+    pub user_id: String,
+    pub group_ids: Vec<String>,
+    pub max_concurrency: Option<i64>,
+    pub requests_per_minute: Option<i64>,
+    pub plan_id: Option<String>,
+    pub subscription_id: Option<String>,
+    pub daily_limit_usd: Option<String>,
+    pub weekly_limit_usd: Option<String>,
+    pub monthly_limit_usd: Option<String>,
+    pub downstream_rate_multiplier: Option<String>,
+    pub starts_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub base_plan_id: Option<String>,
+    pub base_daily_limit_usd: Option<String>,
+    pub base_weekly_limit_usd: Option<String>,
+    pub base_monthly_limit_usd: Option<String>,
+    pub successor_plan_id: Option<String>,
+    pub successor_subscription_id: Option<String>,
+    pub successor_daily_limit_usd: Option<String>,
+    pub successor_weekly_limit_usd: Option<String>,
+    pub successor_monthly_limit_usd: Option<String>,
+    pub successor_downstream_rate_multiplier: Option<String>,
+    pub successor_starts_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub successor_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +155,9 @@ impl RuntimeSnapshotRepository for PgRuntimeSnapshotRepository {
         let account_groups = load_account_groups(&mut transaction).await?;
         let provider_accounts = load_provider_accounts(&mut transaction).await?;
         let group_memberships = load_group_memberships(&mut transaction).await?;
+        let user_runtime = load_user_runtime(&mut transaction).await?;
+        let (client_key_owners, client_key_metadata) =
+            load_client_key_owners(&mut transaction).await?;
         transaction
             .commit()
             .await
@@ -122,6 +173,9 @@ impl RuntimeSnapshotRepository for PgRuntimeSnapshotRepository {
             account_groups,
             provider_accounts,
             group_memberships,
+            user_runtime,
+            client_key_owners,
+            client_key_metadata,
         })
     }
 
@@ -176,14 +230,86 @@ impl SnapshotStorePort for PgRuntimeSnapshotRepository {
             let client_policies = data
                 .client_api_keys
                 .into_iter()
-                .map(|key| {
-                    SnapshotClientPolicyFacts::new(
-                        key.id,
-                        key.plaintext_key,
-                        key.group_ids,
-                        key.limits,
-                    )
-                    .with_request_profiles(key.request_profiles)
+                .filter_map(|key| {
+                    let key_id = key.id.as_str().to_owned();
+                    let Some(owner) = data.client_key_owners.get(&key_id) else {
+                        tracing::warn!(client_key_id = %key_id, "suppressing key without an ownership fact");
+                        return None;
+                    };
+                    if matches!(owner, SnapshotClientKeyOwner::Suppressed) {
+                        return None;
+                    }
+                    let candidate: Result<_, SnapshotStoreError> = (|| {
+                        let runtime = data
+                            .user_runtime
+                            .iter()
+                            .find(|runtime| runtime.key_id == key_id);
+                        let owned = matches!(owner, SnapshotClientKeyOwner::Owned(_));
+                        if owned && runtime.is_none() {
+                            return Err(SnapshotStoreError::unavailable());
+                        }
+                        let group_ids = if let Some(runtime) = runtime {
+                            runtime
+                                .group_ids
+                                .iter()
+                                .cloned()
+                                .map(gateway_core::routing::AccountGroupId::new)
+                                .collect::<Result<Vec<_>, _>>()
+                                .map_err(|_| SnapshotStoreError::unavailable())?
+                        } else {
+                            key.group_ids.clone()
+                        };
+                        let metadata = data
+                            .client_key_metadata
+                            .get(&key_id)
+                            .ok_or_else(SnapshotStoreError::unavailable)?;
+                        let mut policy = SnapshotClientPolicyFacts::new(
+                            key.id,
+                            key.plaintext_key,
+                            group_ids,
+                            key.limits,
+                        )
+                        .with_request_profiles(key.request_profiles)
+                        .with_historical_names(
+                            metadata.username_snapshot.clone(),
+                            metadata.client_api_key_name_snapshot.clone(),
+                        );
+                        if let Some(runtime) = runtime {
+                            let user_id = UserId::new(runtime.user_id.clone())
+                                .map_err(|_| SnapshotStoreError::unavailable())?;
+                            let billing = build_billing_policy(runtime)
+                                .map_err(|_| SnapshotStoreError::unavailable())?;
+                            policy = policy.with_user_runtime(
+                                user_id,
+                                UserRateLimits {
+                                    max_concurrency: runtime
+                                        .max_concurrency
+                                        .map(to_u64_i64)
+                                        .transpose()
+                                        .map_err(|_| SnapshotStoreError::unavailable())?,
+                                    requests_per_minute: runtime
+                                        .requests_per_minute
+                                        .map(to_u64_i64)
+                                        .transpose()
+                                        .map_err(|_| SnapshotStoreError::unavailable())?,
+                                },
+                                billing,
+                                true,
+                            );
+                        } else if owned {
+                            return Err(SnapshotStoreError::unavailable());
+                        }
+                        Ok(policy)
+                    })();
+                    match candidate {
+                        Ok(policy) => Some(policy),
+                        Err(_) => {
+                            // 单个账户策略损坏只撤销该 Key，不能阻止其他账户接收新快照。
+                            // 数据库和全局设置故障仍返回失败，不回退到宽松策略。
+                            tracing::warn!(client_key_id = %key_id, "suppressing key with invalid account policy");
+                            None
+                        }
+                    }
                 })
                 .collect();
             let account_groups = data
@@ -239,6 +365,153 @@ impl SnapshotStorePort for PgRuntimeSnapshotRepository {
                 .and_then(core_revision)
         })
     }
+}
+
+fn to_u64_i64(value: i64) -> StoreResult<u64> {
+    u64::try_from(value).map_err(|_| StoreError::InvalidData {
+        entity: "user runtime policy",
+        message: "limit must be non-negative".to_owned(),
+    })
+}
+
+fn build_billing_policy(
+    runtime: &SnapshotUserRuntimeData,
+) -> StoreResult<Option<ClientBillingPolicy>> {
+    if runtime.base_plan_id.is_none() {
+        return Err(StoreError::InvalidData {
+            entity: "subscription plan",
+            message: "owned user has no enabled base plan".to_owned(),
+        });
+    }
+    let Some(plan_id) = runtime.plan_id.clone() else {
+        return Err(StoreError::InvalidData {
+            entity: "subscription plan",
+            message: "owned user has no enabled active or base plan".to_owned(),
+        });
+    };
+    let plan_id = gateway_core::policy::SubscriptionId::new(plan_id).map_err(|_| {
+        StoreError::InvalidData {
+            entity: "subscription plan",
+            message: "invalid plan ID".to_owned(),
+        }
+    })?;
+    let subscription_id = runtime
+        .subscription_id
+        .clone()
+        .map(gateway_core::policy::SubscriptionId::new)
+        .transpose()
+        .map_err(|_| StoreError::InvalidData {
+            entity: "user subscription",
+            message: "invalid subscription ID".to_owned(),
+        })?;
+    let parse = |value: &Option<String>| -> StoreResult<Option<Decimal>> {
+        value
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(|_| StoreError::InvalidData {
+                entity: "subscription plan",
+                message: "invalid budget amount".to_owned(),
+            })
+    };
+    let multiplier = runtime
+        .downstream_rate_multiplier
+        .as_deref()
+        .unwrap_or("1")
+        .parse()
+        .map_err(|_| StoreError::InvalidData {
+            entity: "user subscription",
+            message: "invalid billing multiplier".to_owned(),
+        })?;
+    let selected = ClientBillingPolicy::for_plan_window(
+        plan_id,
+        subscription_id,
+        UserBudgetLimits {
+            daily_usd: parse(&runtime.daily_limit_usd)?,
+            weekly_usd: parse(&runtime.weekly_limit_usd)?,
+            monthly_usd: parse(&runtime.monthly_limit_usd)?,
+        },
+        multiplier,
+        runtime.starts_at.map(Into::into),
+        runtime.expires_at.map(Into::into),
+    );
+    let mut base_fallback = None;
+    let selected = if let Some(base_plan_id) = runtime.base_plan_id.clone() {
+        let base_plan_id =
+            gateway_core::policy::SubscriptionId::new(base_plan_id).map_err(|_| {
+                StoreError::InvalidData {
+                    entity: "subscription plan",
+                    message: "invalid base plan ID".to_owned(),
+                }
+            })?;
+        let base_multiplier: Decimal = "1".parse().map_err(|_| StoreError::InvalidData {
+            entity: "subscription plan",
+            message: "invalid base multiplier".to_owned(),
+        })?;
+        let base = ClientBillingPolicy::for_plan(
+            base_plan_id,
+            None,
+            UserBudgetLimits {
+                daily_usd: parse(&runtime.base_daily_limit_usd)?,
+                weekly_usd: parse(&runtime.base_weekly_limit_usd)?,
+                monthly_usd: parse(&runtime.base_monthly_limit_usd)?,
+            },
+            base_multiplier,
+            None,
+        );
+        base_fallback = Some(base.clone());
+        if selected.subscription_id().is_some() {
+            selected.with_fallback(base)
+        } else {
+            selected
+        }
+    } else {
+        selected
+    };
+    if let Some(successor_plan_id) = runtime.successor_plan_id.clone() {
+        let successor_plan_id = gateway_core::policy::SubscriptionId::new(successor_plan_id)
+            .map_err(|_| StoreError::InvalidData {
+                entity: "subscription plan",
+                message: "invalid successor plan ID".to_owned(),
+            })?;
+        let successor_subscription_id = runtime
+            .successor_subscription_id
+            .clone()
+            .map(gateway_core::policy::SubscriptionId::new)
+            .transpose()
+            .map_err(|_| StoreError::InvalidData {
+                entity: "user subscription",
+                message: "invalid successor subscription ID".to_owned(),
+            })?;
+        let successor_multiplier: Decimal = runtime
+            .successor_downstream_rate_multiplier
+            .as_deref()
+            .unwrap_or("1")
+            .parse()
+            .map_err(|_| StoreError::InvalidData {
+                entity: "user subscription",
+                message: "invalid successor billing multiplier".to_owned(),
+            })?;
+        let successor = ClientBillingPolicy::for_plan_window(
+            successor_plan_id,
+            successor_subscription_id,
+            UserBudgetLimits {
+                daily_usd: parse(&runtime.successor_daily_limit_usd)?,
+                weekly_usd: parse(&runtime.successor_weekly_limit_usd)?,
+                monthly_usd: parse(&runtime.successor_monthly_limit_usd)?,
+            },
+            successor_multiplier,
+            runtime.successor_starts_at.map(Into::into),
+            runtime.successor_expires_at.map(Into::into),
+        );
+        let successor = if let Some(base) = base_fallback {
+            successor.with_fallback(base)
+        } else {
+            successor
+        };
+        return Ok(Some(selected.with_successor(successor)));
+    }
+    Ok(Some(selected))
 }
 
 fn core_revision(revision: Revision) -> Result<ConfigRevision, SnapshotStoreError> {
@@ -324,29 +597,219 @@ async fn load_client_keys(
             Vec<String>,
             i64,
             i64,
-            sqlx::types::Json<BTreeMap<String, serde_json::Map<String, serde_json::Value>>>,
+            sqlx::types::Json<serde_json::Value>,
         ),
     >(
         "select k.id, k.key,
                 coalesce(array_agg(kg.account_group_id order by kg.account_group_id)
                   filter (where kg.account_group_id is not null), '{}') as group_ids,
-                k.max_concurrency, k.requests_per_minute, k.provider_request_profiles_json
+                k.max_concurrency, k.requests_per_minute,
+                case when k.owner_user_id is null then k.provider_request_profiles_json
+                     else coalesce(u.provider_request_profiles_json, '{}'::jsonb)
+                          || k.provider_request_profiles_json end
          from client_api_keys k
+         left join users u on u.id = k.owner_user_id
          left join client_api_key_groups kg on kg.client_api_key_id = k.id
-         where k.enabled
-         group by k.id
+         where k.enabled and (k.owner_user_id is null or u.enabled)
+         group by k.id, u.id
          order by k.id",
     )
     .fetch_all(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("load snapshot client policies"))?;
+    Ok(rows.into_iter()
+        .filter_map(|row| {
+            let key_id = row.0.clone();
+            let candidate = (|| -> StoreResult<ClientApiKeySnapshot> {
+                let mut key = ClientApiKeySnapshot::from_persisted(row.0, row.1, row.2, row.3, row.4)?;
+                let profiles = serde_json::from_value(row.5.0).map_err(|_| StoreError::InvalidData {
+                    entity: "client profile", message: "invalid profile object".to_owned(),
+                })?;
+                key.request_profiles = decode_request_profiles(profiles)?;
+                Ok(key)
+            })();
+            match candidate {
+                Ok(key) => Some(key),
+                Err(_) => {
+                    tracing::warn!(client_key_id = %key_id, "suppressing invalid client key snapshot row");
+                    None
+                }
+            }
+        })
+        .collect())
+}
+
+async fn load_user_runtime(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> StoreResult<Vec<SnapshotUserRuntimeData>> {
+    let rows = sqlx::query_as::<_, SnapshotUserRuntimeRow>(
+        "select k.id as key_id, u.id as user_id,
+                coalesce((select array_agg(ug.account_group_id order by ug.account_group_id)
+                          from user_account_groups ug where ug.user_id = u.id), '{}') as group_ids,
+                u.max_concurrency_override, u.requests_per_minute_override,
+                case when active.plan_id is not null then active.plan_id else base.plan_id end as plan_id,
+                active.subscription_id,
+                case when active.plan_id is not null then active.daily_limit_usd else base.daily_limit_usd end as daily_limit_usd,
+                case when active.plan_id is not null then active.weekly_limit_usd else base.weekly_limit_usd end as weekly_limit_usd,
+                case when active.plan_id is not null then active.monthly_limit_usd else base.monthly_limit_usd end as monthly_limit_usd,
+                case when active.plan_id is not null then active.downstream_rate_multiplier else '1'::text end as downstream_rate_multiplier,
+                active.starts_at, active.expires_at,
+                base.plan_id as base_plan_id, base.daily_limit_usd as base_daily_limit_usd,
+                base.weekly_limit_usd as base_weekly_limit_usd,
+                base.monthly_limit_usd as base_monthly_limit_usd,
+                upcoming.plan_id as successor_plan_id, upcoming.subscription_id as successor_subscription_id,
+                upcoming.daily_limit_usd as successor_daily_limit_usd,
+                upcoming.weekly_limit_usd as successor_weekly_limit_usd,
+                upcoming.monthly_limit_usd as successor_monthly_limit_usd,
+                upcoming.downstream_rate_multiplier as successor_downstream_rate_multiplier,
+                upcoming.starts_at as successor_starts_at, upcoming.expires_at as successor_expires_at
+         from client_api_keys k
+         join users u on u.id = k.owner_user_id and u.enabled
+         left join lateral (
+           select s.id as subscription_id, s.plan_id, s.starts_at, s.expires_at,
+                  p.daily_limit_usd::text as daily_limit_usd,
+                  p.weekly_limit_usd::text as weekly_limit_usd,
+                  p.monthly_limit_usd::text as monthly_limit_usd,
+                  s.downstream_rate_multiplier::text as downstream_rate_multiplier
+           from user_subscriptions s
+           join subscription_plans p on p.id = s.plan_id and p.enabled
+           where s.user_id = u.id and s.status = 'active'
+             and s.starts_at <= now() and s.expires_at > now()
+           order by s.created_at desc, s.id desc limit 1
+         ) active on true
+         left join lateral (
+           select p.id as plan_id, p.daily_limit_usd::text as daily_limit_usd,
+                  p.weekly_limit_usd::text as weekly_limit_usd,
+                  p.monthly_limit_usd::text as monthly_limit_usd
+           from subscription_plans p where p.is_base and p.enabled
+           order by p.created_at desc, p.id desc limit 1
+         ) base on true
+         left join lateral (
+           select s.id as subscription_id, s.plan_id, s.starts_at, s.expires_at,
+                  p.daily_limit_usd::text as daily_limit_usd,
+                  p.weekly_limit_usd::text as weekly_limit_usd,
+                  p.monthly_limit_usd::text as monthly_limit_usd,
+                  s.downstream_rate_multiplier::text as downstream_rate_multiplier
+           from user_subscriptions s
+           join subscription_plans p on p.id = s.plan_id and p.enabled
+           where s.user_id = u.id and s.status = 'active' and s.starts_at > now()
+           order by s.starts_at asc, s.created_at desc, s.id desc limit 1
+         ) upcoming on true
+         where k.enabled and k.owner_user_id is not null
+         order by k.id",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| postgres_unavailable("load snapshot user runtime policies"))?;
     rows.into_iter()
         .map(|row| {
-            let mut key = ClientApiKeySnapshot::from_persisted(row.0, row.1, row.2, row.3, row.4)?;
-            key.request_profiles = decode_request_profiles(row.5.0)?;
-            Ok(key)
+            Ok(SnapshotUserRuntimeData {
+                key_id: row.key_id,
+                user_id: row.user_id,
+                group_ids: row.group_ids,
+                max_concurrency: row.max_concurrency_override,
+                requests_per_minute: row.requests_per_minute_override,
+                plan_id: row.plan_id,
+                subscription_id: row.subscription_id,
+                daily_limit_usd: row.daily_limit_usd,
+                weekly_limit_usd: row.weekly_limit_usd,
+                monthly_limit_usd: row.monthly_limit_usd,
+                downstream_rate_multiplier: row.downstream_rate_multiplier,
+                starts_at: row.starts_at,
+                expires_at: row.expires_at,
+                base_plan_id: row.base_plan_id,
+                base_daily_limit_usd: row.base_daily_limit_usd,
+                base_weekly_limit_usd: row.base_weekly_limit_usd,
+                base_monthly_limit_usd: row.base_monthly_limit_usd,
+                successor_plan_id: row.successor_plan_id,
+                successor_subscription_id: row.successor_subscription_id,
+                successor_daily_limit_usd: row.successor_daily_limit_usd,
+                successor_weekly_limit_usd: row.successor_weekly_limit_usd,
+                successor_monthly_limit_usd: row.successor_monthly_limit_usd,
+                successor_downstream_rate_multiplier: row.successor_downstream_rate_multiplier,
+                successor_starts_at: row.successor_starts_at,
+                successor_expires_at: row.successor_expires_at,
+            })
         })
         .collect()
+}
+
+async fn load_client_key_owners(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> StoreResult<(
+    BTreeMap<String, SnapshotClientKeyOwner>,
+    BTreeMap<String, SnapshotClientKeyMetadata>,
+)> {
+    let rows = sqlx::query_as::<_, (String, Option<String>, bool, String, Option<String>)>(
+        "select k.id, k.owner_user_id, coalesce(u.enabled, false), k.name, u.username
+         from client_api_keys k
+         left join users u on u.id = k.owner_user_id
+         where k.enabled
+         order by k.id",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| postgres_unavailable("load snapshot client key owners"))?;
+    let mut owners = BTreeMap::new();
+    let mut metadata = BTreeMap::new();
+    for (key_id, owner_user_id, owner_enabled, key_name, username) in rows {
+        let owner = match owner_user_id {
+            None => SnapshotClientKeyOwner::Ownerless,
+            Some(user_id) if owner_enabled => SnapshotClientKeyOwner::Owned(user_id),
+            Some(_) => SnapshotClientKeyOwner::Suppressed,
+        };
+        if owners.insert(key_id.clone(), owner).is_some() {
+            return Err(StoreError::InvalidData {
+                entity: "client API key owner",
+                message: "duplicate client API key".to_owned(),
+            });
+        }
+        if metadata
+            .insert(
+                key_id,
+                SnapshotClientKeyMetadata {
+                    username_snapshot: username,
+                    client_api_key_name_snapshot: Some(key_name),
+                },
+            )
+            .is_some()
+        {
+            return Err(StoreError::InvalidData {
+                entity: "client API key metadata",
+                message: "duplicate client API key".to_owned(),
+            });
+        }
+    }
+    Ok((owners, metadata))
+}
+
+#[derive(sqlx::FromRow)]
+struct SnapshotUserRuntimeRow {
+    key_id: String,
+    user_id: String,
+    group_ids: Vec<String>,
+    max_concurrency_override: Option<i64>,
+    requests_per_minute_override: Option<i64>,
+    plan_id: Option<String>,
+    subscription_id: Option<String>,
+    daily_limit_usd: Option<String>,
+    weekly_limit_usd: Option<String>,
+    monthly_limit_usd: Option<String>,
+    downstream_rate_multiplier: Option<String>,
+    starts_at: Option<chrono::DateTime<chrono::Utc>>,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    base_plan_id: Option<String>,
+    base_daily_limit_usd: Option<String>,
+    base_weekly_limit_usd: Option<String>,
+    base_monthly_limit_usd: Option<String>,
+    successor_plan_id: Option<String>,
+    successor_subscription_id: Option<String>,
+    successor_daily_limit_usd: Option<String>,
+    successor_weekly_limit_usd: Option<String>,
+    successor_monthly_limit_usd: Option<String>,
+    successor_downstream_rate_multiplier: Option<String>,
+    successor_starts_at: Option<chrono::DateTime<chrono::Utc>>,
+    successor_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 async fn load_account_groups(

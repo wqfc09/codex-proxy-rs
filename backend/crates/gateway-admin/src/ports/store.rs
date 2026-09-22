@@ -22,13 +22,15 @@ use crate::model::{
     },
     auth::{AdminAuditEvent, AuthSession},
     client_keys::{
-        ClientKeyListQuery, ClientKeyPage, ClientKeyRecord, ClientKeySecret, DeleteClientKey,
-        NewClientKey, ResetClientKeyBudget, SetClientKeyEnabled, UpdateClientKey,
+        ClientKeyListQuery, ClientKeyPage, ClientKeyRecord, ClientKeySecret,
+        ClientKeyUsageBudgetContext, DeleteClientKey, NewClientKey, ReplaceClientKeyIdentity,
+        ResetClientKeyBudget, SetClientKeyEnabled, UpdateClientKey,
     },
     observability::{
         DashboardObservation, DashboardRuntimeSlots, DiagnosticDimension, DiagnosticObservation,
         OpsErrorPage, OpsErrorQuery, RequestMetricPoint, TimeRange, UsageCalculatedBillingFact,
-        UsageDetail, UsageFilter, UsageOverview, UsagePage, UsageQuery,
+        UsageDetail, UsageFilter, UsageOverview, UsagePage, UsageQuery, UserUsageFilter,
+        UserUsagePage, UserUsageQuery, UserUsageRecord, UserUsageSummary,
     },
     provider_credentials::{
         AuthorizationCommit, CredentialDetails, CredentialImportCommit, CredentialImportResult,
@@ -36,6 +38,8 @@ use crate::model::{
     },
     quota_forecast_sampling::QuotaForecastHistory,
     settings::{AdminApiKey, AdminApiKeyMutation, ReplaceRuntimeSettings, RuntimeSettings},
+    subscription_billing::*,
+    users::{SessionTtlSettings, TurnstileSettings, UpdateUser, UserCredentialRecord, UserRecord},
 };
 
 /// 管理端可判定的持久化失败类型。
@@ -242,11 +246,203 @@ pub trait AuthStore: Send + Sync {
         password_hash: &str,
     ) -> AdminStoreResult<bool>;
 
+    async fn load_user_by_username(
+        &self,
+        _username: &str,
+    ) -> AdminStoreResult<Option<UserCredentialRecord>> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "user identity",
+            "user identity lookup capability is unavailable",
+        ))
+    }
+
+    async fn load_user_by_id(
+        &self,
+        _user_id: &str,
+    ) -> AdminStoreResult<Option<UserCredentialRecord>> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "user identity",
+            "user identity lookup capability is unavailable",
+        ))
+    }
+
+    async fn load_user_key_identity(
+        &self,
+        _user_id: &str,
+    ) -> AdminStoreResult<crate::model::users::UserKeyIdentity> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "user key identity",
+            "identity store is unavailable",
+        ))
+    }
+
+    async fn replace_user_key_identity(
+        &self,
+        _user_id: &str,
+        _identity: crate::model::users::UserKeyIdentity,
+        _context: &MutationContext,
+    ) -> AdminStoreResult<Revision> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "user key identity",
+            "identity store is unavailable",
+        ))
+    }
+
+    async fn list_users(&self) -> AdminStoreResult<Vec<UserRecord>> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "user identity",
+            "user identity capability is unavailable",
+        ))
+    }
+
+    async fn create_user(
+        &self,
+        _user: UserCredentialRecord,
+        _context: &MutationContext,
+    ) -> AdminStoreResult<UserRecord> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "user identity",
+            "user identity capability is unavailable",
+        ))
+    }
+
+    async fn update_user(
+        &self,
+        _command: &UpdateUser,
+        _context: &MutationContext,
+    ) -> AdminStoreResult<(Revision, UserRecord)> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "user identity",
+            "user identity capability is unavailable",
+        ))
+    }
+
+    async fn update_user_username(
+        &self,
+        _user_id: &str,
+        _username: &str,
+        _expected_session_version: u64,
+    ) -> AdminStoreResult<Option<UserRecord>> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "user identity",
+            "user identity capability is unavailable",
+        ))
+    }
+
+    /// 仅当 canonical 用户哈希仍等于 expected_hash 时更新，避免自助改密覆盖并发重置。
+    async fn update_user_password_hash_if_matches(
+        &self,
+        _user_id: &str,
+        _expected_hash: &str,
+        _password_hash: &str,
+    ) -> AdminStoreResult<bool> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "user identity",
+            "user identity capability is unavailable",
+        ))
+    }
+
+    async fn reset_user_password_hash(
+        &self,
+        _user_id: &str,
+        _password_hash: &str,
+        _context: &MutationContext,
+    ) -> AdminStoreResult<UserRecord> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "user identity",
+            "user identity capability is unavailable",
+        ))
+    }
+
+    async fn bump_user_session_version(
+        &self,
+        _user_id: &str,
+        _context: &MutationContext,
+    ) -> AdminStoreResult<UserRecord> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "user sessions",
+            "user session version capability is unavailable",
+        ))
+    }
+
+    async fn delete_user(
+        &self,
+        _user_id: &str,
+        _context: &MutationContext,
+    ) -> AdminStoreResult<Revision> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "user identity",
+            "user deletion capability is unavailable",
+        ))
+    }
+
+    async fn load_session_ttl_settings(&self) -> AdminStoreResult<Option<SessionTtlSettings>> {
+        Ok(None)
+    }
+
+    async fn replace_session_ttl_settings(
+        &self,
+        _settings: SessionTtlSettings,
+        _context: &MutationContext,
+    ) -> AdminStoreResult<SessionTtlSettings> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "auth settings",
+            "session TTL settings capability is unavailable",
+        ))
+    }
+
+    async fn load_turnstile_settings(&self) -> AdminStoreResult<TurnstileSettings> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "auth settings",
+            "auth settings capability is unavailable",
+        ))
+    }
+
+    async fn replace_turnstile_settings(
+        &self,
+        _settings: TurnstileSettings,
+        _context: &MutationContext,
+    ) -> AdminStoreResult<TurnstileSettings> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "auth settings",
+            "auth settings capability is unavailable",
+        ))
+    }
+
     async fn load_admin_api_key(&self) -> AdminStoreResult<Option<AdminApiKey>>;
 
     async fn load_session(&self, session_id: &str) -> AdminStoreResult<Option<AuthSession>>;
 
     async fn store_session(&self, session_id: &str, session: &AuthSession) -> AdminStoreResult<()>;
+
+    /// 自助改密只刷新原会话；并发注销或过期后不得重新创建，也不得延长有效期。
+    async fn replace_session_if_matches(
+        &self,
+        _session_id: &str,
+        _expected: &AuthSession,
+        _replacement: &AuthSession,
+    ) -> AdminStoreResult<bool> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "authentication session",
+            "atomic session replacement is unavailable",
+        ))
+    }
 
     async fn delete_session(&self, session_id: &str) -> AdminStoreResult<Option<AuthSession>>;
 
@@ -267,6 +463,14 @@ pub trait AuthStore: Send + Sync {
     async fn append_audit_event(&self, event: AdminAuditEvent) -> AdminStoreResult<()>;
 }
 
+fn user_client_key_capability_unavailable() -> AdminStoreError {
+    AdminStoreError::new(
+        AdminStoreErrorKind::Unavailable,
+        "user client API key",
+        "user client API key capability is unavailable",
+    )
+}
+
 /// Client API Key 资料读取与管理写入。
 #[async_trait]
 pub trait ClientKeyStore: Send + Sync {
@@ -275,6 +479,20 @@ pub trait ClientKeyStore: Send + Sync {
         &self,
         id: &gateway_core::policy::ClientApiKeyId,
     ) -> AdminStoreResult<Option<ClientKeyRecord>>;
+
+    /// 已验证 Bearer Key 的只读额度上下文；不返回明文、分组或 Provider 身份配置。
+    async fn usage_budget_context(
+        &self,
+        id: &gateway_core::policy::ClientApiKeyId,
+    ) -> AdminStoreResult<Option<ClientKeyUsageBudgetContext>> {
+        self.get_client_key(id).await.map(|record| {
+            record.map(|record| ClientKeyUsageBudgetContext {
+                owner_user_id: None,
+                enabled: record.enabled,
+                budget: record.budget,
+            })
+        })
+    }
 
     async fn list_client_keys(&self, query: ClientKeyListQuery) -> AdminStoreResult<ClientKeyPage>;
 
@@ -313,6 +531,155 @@ pub trait ClientKeyStore: Send + Sync {
         command: ResetClientKeyBudget,
         context: &MutationContext,
     ) -> AdminStoreResult<()>;
+    async fn reset_user_client_key_budget(
+        &self,
+        _user_id: &str,
+        _command: ResetClientKeyBudget,
+    ) -> AdminStoreResult<()> {
+        Err(user_client_key_capability_unavailable())
+    }
+
+    async fn list_user_client_keys(
+        &self,
+        _user_id: &str,
+        _query: ClientKeyListQuery,
+    ) -> AdminStoreResult<ClientKeyPage> {
+        Err(user_client_key_capability_unavailable())
+    }
+
+    async fn reveal_user_client_key(
+        &self,
+        _user_id: &str,
+        _id: &gateway_core::policy::ClientApiKeyId,
+    ) -> AdminStoreResult<Option<ClientKeySecret>> {
+        Err(user_client_key_capability_unavailable())
+    }
+
+    async fn replace_user_client_key_identity(
+        &self,
+        _user_id: &str,
+        _command: ReplaceClientKeyIdentity,
+        _context: &MutationContext,
+    ) -> AdminStoreResult<(Revision, ClientKeyRecord)> {
+        Err(user_client_key_capability_unavailable())
+    }
+
+    async fn create_user_client_key(
+        &self,
+        _user_id: &str,
+        _command: NewClientKey,
+    ) -> AdminStoreResult<(Revision, ClientKeyRecord)> {
+        Err(user_client_key_capability_unavailable())
+    }
+
+    async fn update_user_client_key(
+        &self,
+        _user_id: &str,
+        _command: UpdateClientKey,
+    ) -> AdminStoreResult<(Revision, ClientKeyRecord)> {
+        Err(user_client_key_capability_unavailable())
+    }
+
+    async fn set_user_client_key_enabled(
+        &self,
+        _user_id: &str,
+        _command: SetClientKeyEnabled,
+    ) -> AdminStoreResult<(Revision, ClientKeyRecord)> {
+        Err(user_client_key_capability_unavailable())
+    }
+
+    async fn delete_user_client_key(
+        &self,
+        _user_id: &str,
+        _command: DeleteClientKey,
+    ) -> AdminStoreResult<Revision> {
+        Err(user_client_key_capability_unavailable())
+    }
+}
+
+/// Subscription Plan、User Subscription、账户总额度与 downstream rate 管理事务。
+#[async_trait]
+pub trait SubscriptionBillingStore: Send + Sync {
+    async fn list_subscription_plans(&self) -> AdminStoreResult<Vec<SubscriptionPlanRecord>>;
+    async fn create_subscription_plan(
+        &self,
+        command: NewSubscriptionPlan,
+        context: &MutationContext,
+    ) -> AdminStoreResult<SubscriptionPlanMutation>;
+    async fn update_subscription_plan(
+        &self,
+        command: UpdateSubscriptionPlan,
+        context: &MutationContext,
+    ) -> AdminStoreResult<SubscriptionPlanMutation>;
+    async fn set_subscription_plan_enabled(
+        &self,
+        command: SetSubscriptionPlanEnabled,
+        context: &MutationContext,
+    ) -> AdminStoreResult<SubscriptionPlanMutation>;
+    async fn current_user_subscription(
+        &self,
+        user_id: &str,
+    ) -> AdminStoreResult<Option<UserSubscriptionRecord>>;
+    async fn grant_user_subscription(
+        &self,
+        command: GrantUserSubscription,
+        context: &MutationContext,
+    ) -> AdminStoreResult<UserSubscriptionMutation>;
+    async fn update_user_subscription(
+        &self,
+        command: UpdateUserSubscription,
+        context: &MutationContext,
+    ) -> AdminStoreResult<UserSubscriptionMutation>;
+    async fn renew_user_subscription(
+        &self,
+        command: RenewUserSubscription,
+        context: &MutationContext,
+    ) -> AdminStoreResult<UserSubscriptionMutation>;
+    async fn revoke_user_subscription(
+        &self,
+        user_id: &str,
+        context: &MutationContext,
+    ) -> AdminStoreResult<Option<UserSubscriptionMutation>>;
+    async fn user_billing_summary(&self, user_id: &str) -> AdminStoreResult<UserBillingSummary>;
+    async fn list_user_subscription_history(
+        &self,
+        user_id: &str,
+        pagination: ControlPageQuery,
+    ) -> AdminStoreResult<ControlPage<UserSubscriptionRecord>>;
+    async fn list_user_groups(&self, user_id: &str) -> AdminStoreResult<UserGroups>;
+    async fn replace_user_groups(
+        &self,
+        user_id: &str,
+        group_ids: Vec<gateway_core::routing::AccountGroupId>,
+        context: &MutationContext,
+    ) -> AdminStoreResult<UserGroups>;
+    async fn add_user_budget_credit(
+        &self,
+        command: AddUserBudgetCredit,
+        context: &MutationContext,
+    ) -> AdminStoreResult<(Revision, UserBudgetCreditRecord)>;
+    async fn reset_user_budget(
+        &self,
+        command: ResetUserBudget,
+        context: &MutationContext,
+    ) -> AdminStoreResult<Revision> {
+        let _ = (command, context);
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "user budget",
+            "user budget reset capability is unavailable",
+        ))
+    }
+    async fn list_user_budget_credits(
+        &self,
+        user_id: &str,
+        window: Option<BudgetWindowKind>,
+        pagination: ControlPageQuery,
+    ) -> AdminStoreResult<ControlPage<UserBudgetCreditRecord>>;
+    async fn list_user_management(
+        &self,
+        query: UserManagementQuery,
+    ) -> AdminStoreResult<ControlPage<UserManagementRecord>>;
 }
 
 /// Provider-neutral account group management transactions.
@@ -397,6 +764,43 @@ pub trait ObservabilityStore: Send + Sync {
     async fn list_usage_records(&self, query: UsageQuery) -> AdminStoreResult<UsagePage>;
 
     async fn usage_record_detail(&self, request_id: &str) -> AdminStoreResult<UsageDetail>;
+
+    async fn list_user_usage_records(
+        &self,
+        _user_id: &str,
+        _query: UserUsageQuery,
+    ) -> AdminStoreResult<UserUsagePage> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "observability",
+            "user usage records unavailable",
+        ))
+    }
+
+    async fn user_usage_record_detail(
+        &self,
+        _user_id: &str,
+        _request_id: &str,
+    ) -> AdminStoreResult<UserUsageRecord> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "observability",
+            "user usage detail unavailable",
+        ))
+    }
+
+    async fn user_usage_summary(
+        &self,
+        _user_id: &str,
+        _range: TimeRange,
+        _filter: UserUsageFilter,
+    ) -> AdminStoreResult<UserUsageSummary> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "observability",
+            "user usage summary unavailable",
+        ))
+    }
 
     async fn usage_summary(
         &self,
@@ -485,6 +889,7 @@ pub struct AdminStorePorts {
     accounts: AdminAccountStorePorts,
     auth: Arc<dyn AuthStore>,
     client_keys: Arc<dyn ClientKeyStore>,
+    subscription_billing: Option<Arc<dyn SubscriptionBillingStore>>,
     observability: Arc<dyn ObservabilityStore>,
     settings: Arc<dyn SettingsStore>,
     backup: BackupStorePorts,
@@ -504,6 +909,7 @@ impl AdminStorePorts {
             accounts,
             auth,
             client_keys,
+            subscription_billing: None,
             observability,
             settings,
             backup,
@@ -541,6 +947,16 @@ impl AdminStorePorts {
     }
 
     #[must_use]
+    pub fn subscription_billing(&self) -> Option<Arc<dyn SubscriptionBillingStore>> {
+        self.subscription_billing.clone()
+    }
+
+    #[must_use]
+    pub fn with_subscription_billing(mut self, store: Arc<dyn SubscriptionBillingStore>) -> Self {
+        self.subscription_billing = Some(store);
+        self
+    }
+
     pub fn observability(&self) -> Arc<dyn ObservabilityStore> {
         self.observability.clone()
     }

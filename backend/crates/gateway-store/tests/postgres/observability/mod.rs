@@ -1265,6 +1265,7 @@ async fn admin_observability_adapter_preserves_utc_queries_metrics_costs_and_det
         .list_usage_records(admin_observability::UsageQuery {
             range,
             filter: admin_observability::UsageFilter {
+                user_id: None,
                 client_api_key_ref: Some("key_observe".to_owned()),
                 request_id: Some("req_observe_success".to_owned()),
                 provider_account_ref: Some("acct_observe".to_owned()),
@@ -1825,6 +1826,327 @@ async fn observability_queries_preserve_request_account_cost_and_diagnostic_fact
     );
 
     database.close().await;
+}
+
+async fn seed_user_usage_owners(pool: &PgPool) {
+    sqlx::query(
+        "insert into users (id,username,password_hash,role,created_at,updated_at)
+        values ('usage_owner_a','usage-owner-a','test-hash','user',now(),now()),
+               ('usage_owner_b','usage-owner-b','test-hash','user',now(),now())",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into client_api_keys
+        (id,owner_user_id,name,key,max_concurrency,requests_per_minute,created_at,updated_at)
+        values ('usage_key_a','usage_owner_a','Owner A key','test-only-usage-a',0,0,now(),now()),
+               ('usage_key_b','usage_owner_b','Owner B key','test-only-usage-b',0,0,now(),now())",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn seed_user_usage_request(
+    pool: &PgPool,
+    id: &str,
+    user: &str,
+    key: &str,
+    started_at: chrono::DateTime<Utc>,
+    billed: Option<&str>,
+) {
+    sqlx::query(
+        "insert into model_requests
+        (id,client_api_key_ref,user_id,plan_id,config_revision,protocol,operation,endpoint,client_transport,
+         requested_model_id,provider_kind,provider_account_ref,upstream_transport,
+         attempt_count,upstream_send_state,downstream_committed_at,
+         outcome,client_status_code,input_tokens,output_tokens,total_tokens,
+         cost_source,cost_amount,cost_currency,downstream_rate_multiplier,downstream_billed_amount,
+         client_api_key_name_snapshot,latency_ms,started_at,deadline_at,completed_at,
+         routing_scope,routing_group_refs,routing_group_names_snapshot)
+        values ($1,$2,$3,(select id from subscription_plans where is_base),1,'openai','responses','/v1/responses','http_sse',
+          'public-model','openai','acct_history','http_sse',1,'sent',$4,'succeeded',200,10,2,12,
+          'calculated',0.2,'USD',1.5,$5::text::numeric,'Historical key name',50,
+          $4,$4 + interval '30 seconds',$4 + interval '1 second',
+          'groups',array['grp_history'],jsonb_build_array('Historical group'))",
+    )
+    .bind(id)
+    .bind(key)
+    .bind(user)
+    .bind(started_at)
+    .bind(billed)
+    .execute(pool)
+    .await
+    .expect("seed owned usage request");
+}
+
+fn user_usage_test_query(
+    now: chrono::DateTime<Utc>,
+    filter: admin_observability::UserUsageFilter,
+) -> admin_observability::UserUsageQuery {
+    admin_observability::UserUsageQuery {
+        range: admin_observability::TimeRange::new(
+            now - TimeDelta::hours(1),
+            now + TimeDelta::hours(1),
+        )
+        .unwrap(),
+        filter,
+        current_page: 1,
+        page_size: PageSize::new(10).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn user_usage_queries_scope_counts_details_and_deleted_key_history() {
+    let Some(db) = TestDatabase::create("user_usage_scope").await else {
+        return;
+    };
+    seed_user_usage_owners(&db.pool).await;
+    let now = Utc::now();
+    seed_user_usage_request(
+        &db.pool,
+        "usage_req_a",
+        "usage_owner_a",
+        "usage_key_a",
+        now,
+        Some("0.3"),
+    )
+    .await;
+    seed_user_usage_request(
+        &db.pool,
+        "usage_req_b",
+        "usage_owner_b",
+        "usage_key_b",
+        now,
+        Some("0.3"),
+    )
+    .await;
+    let store = admin_observability_store(&db.pool);
+    let query = user_usage_test_query(now, Default::default());
+    let page = store
+        .list_user_usage_records("usage_owner_a", query.clone())
+        .await
+        .unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].id, "usage_req_a");
+    assert_eq!(page.items[0].client_api_key_name, "Owner A key");
+    assert_eq!(
+        page.items[0].downstream_billed_amount,
+        Some("0.3".parse().unwrap())
+    );
+    assert_eq!(
+        store
+            .user_usage_record_detail("usage_owner_a", "usage_req_b")
+            .await
+            .unwrap_err()
+            .kind(),
+        gateway_admin::ports::store::AdminStoreErrorKind::NotFound
+    );
+    assert!(
+        store
+            .list_user_usage_records("", query.clone())
+            .await
+            .is_err()
+    );
+
+    let foreign = user_usage_test_query(
+        now,
+        admin_observability::UserUsageFilter {
+            client_api_key_ref: Some("usage_key_b".to_owned()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        store
+            .list_user_usage_records("usage_owner_a", foreign.clone())
+            .await
+            .unwrap()
+            .total,
+        0
+    );
+    let summary = store
+        .user_usage_summary("usage_owner_a", foreign.range, foreign.filter)
+        .await
+        .unwrap();
+    assert_eq!(summary.request_count, 0);
+    assert_eq!(summary.billed_usd, Some("0".parse().unwrap()));
+
+    sqlx::query("update client_api_keys set name='Renamed owner A key' where id='usage_key_a'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let renamed = store
+        .user_usage_record_detail("usage_owner_a", "usage_req_a")
+        .await
+        .unwrap();
+    assert_eq!(renamed.client_api_key_name, "Renamed owner A key");
+    let summary = store
+        .user_usage_summary("usage_owner_a", query.range, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.request_count, 1);
+    assert_eq!(summary.client_keys[0].name, "Renamed owner A key");
+    sqlx::query("delete from client_api_keys where id='usage_key_a'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let deleted = store
+        .user_usage_record_detail("usage_owner_a", "usage_req_a")
+        .await
+        .unwrap();
+    assert_eq!(deleted.client_api_key_name, "Historical key name");
+    let historical = user_usage_test_query(
+        now,
+        admin_observability::UserUsageFilter {
+            client_api_key_ref: Some("usage_key_a".to_owned()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        store
+            .list_user_usage_records("usage_owner_a", historical.clone())
+            .await
+            .unwrap()
+            .total,
+        1
+    );
+    assert_eq!(
+        store
+            .list_user_usage_records("usage_owner_b", historical)
+            .await
+            .unwrap()
+            .total,
+        0
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn user_usage_summary_distinguishes_empty_unknown_and_known_zero() {
+    let Some(db) = TestDatabase::create("user_usage_cost_state").await else {
+        return;
+    };
+    seed_user_usage_owners(&db.pool).await;
+    let now = Utc::now();
+    let store = admin_observability_store(&db.pool);
+    let range = user_usage_test_query(now, Default::default()).range;
+    let empty = store
+        .user_usage_summary("usage_owner_a", range, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(empty.billed_usd, Some("0".parse().unwrap()));
+    assert_eq!(
+        (empty.billed_known_count, empty.billed_unknown_count),
+        (0, 0)
+    );
+    seed_user_usage_request(
+        &db.pool,
+        "usage_unknown",
+        "usage_owner_a",
+        "usage_key_a",
+        now,
+        None,
+    )
+    .await;
+    let unknown = store
+        .user_usage_summary("usage_owner_a", range, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        unknown.billed_usd, None,
+        "do not infer downstream charges from a known provider cost"
+    );
+    assert_eq!(
+        (unknown.billed_known_count, unknown.billed_unknown_count),
+        (0, 1)
+    );
+    let detail = store
+        .user_usage_record_detail("usage_owner_a", "usage_unknown")
+        .await
+        .unwrap();
+    assert!(detail.downstream_billed_amount.is_none());
+    seed_user_usage_request(
+        &db.pool,
+        "usage_zero",
+        "usage_owner_a",
+        "usage_key_a",
+        now,
+        Some("0"),
+    )
+    .await;
+    let zero = store
+        .user_usage_summary("usage_owner_a", range, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(zero.billed_usd, Some("0".parse().unwrap()));
+    assert_eq!((zero.billed_known_count, zero.billed_unknown_count), (1, 1));
+    assert_eq!(
+        zero.daily
+            .iter()
+            .map(|point| point.billed_unknown_count)
+            .sum::<u64>(),
+        1
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn user_usage_pagination_and_summary_use_the_same_half_open_range() {
+    let Some(db) = TestDatabase::create("user_usage_range").await else {
+        return;
+    };
+    seed_user_usage_owners(&db.pool).await;
+    let start = Utc::now();
+    let end = start + TimeDelta::minutes(5);
+    for (id, when) in [
+        ("usage_at_start", start),
+        ("usage_middle", start + TimeDelta::minutes(1)),
+        ("usage_before", start - TimeDelta::seconds(1)),
+        ("usage_at_end", end),
+    ] {
+        seed_user_usage_request(
+            &db.pool,
+            id,
+            "usage_owner_a",
+            "usage_key_a",
+            when,
+            Some("0.3"),
+        )
+        .await;
+    }
+    let store = admin_observability_store(&db.pool);
+    let mut query = user_usage_test_query(start, Default::default());
+    query.range = admin_observability::TimeRange::new(start, end).unwrap();
+    query.page_size = PageSize::new(1).unwrap();
+    let first = store
+        .list_user_usage_records("usage_owner_a", query.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.total, 2);
+    assert_eq!(first.items[0].id, "usage_middle");
+    query.current_page = 2;
+    let second = store
+        .list_user_usage_records("usage_owner_a", query.clone())
+        .await
+        .unwrap();
+    assert_eq!(second.total, 2);
+    assert_eq!(second.items[0].id, "usage_at_start");
+    let summary = store
+        .user_usage_summary("usage_owner_a", query.range, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.request_count, 2);
+    assert_eq!(summary.billed_usd, Some("0.6".parse().unwrap()));
+    assert_eq!(
+        summary
+            .trend
+            .iter()
+            .map(|point| point.request_count)
+            .sum::<u64>(),
+        2
+    );
+    db.close().await;
 }
 
 async fn seed_observability_facts(

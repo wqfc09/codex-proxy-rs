@@ -11,10 +11,12 @@ use gateway_admin::{
 use gateway_core::{
     engine::{
         ModelRequestId,
-        budget::{ClientBudgetCharge, ClientBudgetPort, ClientBudgetStatus},
+        budget::{ClientBudgetCharge, ClientBudgetPort, ClientBudgetStatus, UserBudgetCharge},
     },
     error::GatewayErrorKind,
-    policy::{ClientApiKeyId, RateLimits},
+    policy::{
+        ClientApiKeyId, ClientBillingPolicy, RateLimits, SubscriptionId, UserBudgetLimits, UserId,
+    },
 };
 use gateway_store::postgres::{
     ClientApiKeyRepository as _, PgAdminClientKeyStore, PgClientApiKeyRepository,
@@ -284,6 +286,184 @@ async fn key_usage_profile_reuses_current_budget_without_revealing_or_advancing_
             .canonical(),
         "0.640001"
     );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn user_settlement_is_idempotent_and_survives_key_deletion() {
+    let Some(database) = TestDatabase::create("user_budget_atomic_settlement").await else {
+        return;
+    };
+    sqlx::query(
+        "insert into users (id, username, password_hash, role, enabled, created_at, updated_at)
+         values ('user_budget_atomic', 'user_budget_atomic', 'hash', 'user', true, now(), now())",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    seed(&database, "owned_budget_key", "10", "10").await;
+    sqlx::query(
+        "update client_api_keys set owner_user_id='user_budget_atomic' where id='owned_budget_key'",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let plan_id: String = sqlx::query_scalar("select id from subscription_plans where is_base")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    let policy = ClientBillingPolicy::for_plan(
+        SubscriptionId::new(plan_id).unwrap(),
+        None,
+        UserBudgetLimits {
+            daily_usd: Some("10".parse().unwrap()),
+            weekly_usd: Some("10".parse().unwrap()),
+            monthly_usd: Some("10".parse().unwrap()),
+        },
+        "2".parse().unwrap(),
+        None,
+    );
+    let store = PgClientBudgetStore::new(database.pool.clone());
+    let first = UserBudgetCharge {
+        user_id: UserId::new("user_budget_atomic").unwrap(),
+        key_id: key_id("owned_budget_key"),
+        request_id: ModelRequestId::new("req_user_budget_first").unwrap(),
+        base_amount_usd: Some("1".parse().unwrap()),
+        policy: policy.clone(),
+        completed_at: SystemTime::now(),
+    };
+    store.settle_user(first.clone()).await.unwrap();
+    store.settle_user(first).await.unwrap();
+    let key_events_before_delete: i64 = sqlx::query_scalar(
+        "select count(*) from client_key_charge_events where client_api_key_id='owned_budget_key'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(key_events_before_delete, 1);
+    sqlx::query("delete from client_api_keys where id='owned_budget_key'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    store
+        .settle_user(UserBudgetCharge {
+            request_id: ModelRequestId::new("req_user_budget_after_delete").unwrap(),
+            key_id: key_id("owned_budget_key"),
+            user_id: UserId::new("user_budget_atomic").unwrap(),
+            base_amount_usd: Some("1".parse().unwrap()),
+            policy,
+            completed_at: SystemTime::now(),
+        })
+        .await
+        .unwrap();
+    let counts: (i64, i64) = sqlx::query_as(
+        "select (select count(*) from user_charge_events where user_id='user_budget_atomic'),
+                (select count(*) from client_key_charge_events where client_api_key_id='owned_budget_key')",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    // Key 账本受 client_api_keys 的 ON DELETE CASCADE 约束；删除 Key 后只保留 User 历史消费。
+    assert_eq!(counts, (2, 0));
+    let used: String = sqlx::query_scalar(
+        "select daily_used_usd::text from user_budget_windows where user_id='user_budget_atomic'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        used.parse::<gateway_core::metering::Decimal>()
+            .unwrap()
+            .canonical(),
+        "4"
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn user_budget_credit_matches_current_plan_and_window_only() {
+    let Some(database) = TestDatabase::create("user_budget_credit_admission").await else {
+        return;
+    };
+    sqlx::query(
+        "insert into users (id, username, password_hash, role, enabled, created_at, updated_at)
+         values ('user_credit_admission', 'user_credit_admission', 'hash', 'user', true, now(), now())",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let plan_id: String = sqlx::query_scalar("select id from subscription_plans where is_base")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    let policy = ClientBillingPolicy::for_plan(
+        SubscriptionId::new(plan_id.clone()).unwrap(),
+        None,
+        UserBudgetLimits {
+            daily_usd: Some("1".parse().unwrap()),
+            weekly_usd: Some("10".parse().unwrap()),
+            monthly_usd: Some("10".parse().unwrap()),
+        },
+        "1".parse().unwrap(),
+        None,
+    );
+    let store = PgClientBudgetStore::new(database.pool.clone());
+    let user_id = UserId::new("user_credit_admission").unwrap();
+    store
+        .admit_user(user_id.clone(), policy.clone())
+        .await
+        .unwrap();
+    let (daily_start, daily_end): (DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "select daily_start, daily_end from user_budget_windows where user_id='user_credit_admission'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into user_budget_credits
+         (id,user_id,plan_id,subscription_id,window_kind,window_start,window_end,amount_usd,idempotency_key,reason)
+         values ('credit_admission_current','user_credit_admission',$1,null,'daily',$2,$3,1,'credit-admission-current','test')",
+    )
+    .bind(&plan_id)
+    .bind(daily_start)
+    .bind(daily_end)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "update user_budget_windows set daily_used_usd=1 where user_id='user_credit_admission'",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    // 当前 plan、subscription=null、窗口完全匹配时，赠额把日额度从 1 提升到 2。
+    store
+        .admit_user(user_id.clone(), policy.clone())
+        .await
+        .unwrap();
+    sqlx::query(
+        "update user_budget_windows set daily_used_usd=2 where user_id='user_credit_admission'",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    assert!(
+        store
+            .admit_user(user_id.clone(), policy.clone())
+            .await
+            .is_err()
+    );
+
+    // 窗口滚动后边界变化，旧窗口赠额不可带入新窗口。
+    sqlx::query(
+        "update user_budget_windows
+         set daily_start=now()-interval '2 days', daily_end=now()-interval '1 second', daily_used_usd=1
+         where user_id='user_credit_admission'",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    store.admit_user(user_id, policy).await.unwrap();
     database.close().await;
 }
 
@@ -563,5 +743,85 @@ async fn budget_database_outage_fails_closed() {
         Some("key_budget_unavailable")
     );
     assert!(store.settle(charge("key", "offline", "1")).await.is_err());
+    database.close().await;
+}
+
+#[tokio::test]
+async fn delayed_user_settlement_uses_completion_window_and_never_rewinds_a_new_window() {
+    let Some(database) = TestDatabase::create("delayed_user_completion").await else {
+        return;
+    };
+    sqlx::query("insert into users(id,username,password_hash,role,created_at,updated_at) values('delayed_user','delayed-user','hash','user',now(),now())").execute(&database.pool).await.unwrap();
+    seed(&database, "delayed_key", "0", "0").await;
+    sqlx::query("update client_api_keys set owner_user_id='delayed_user' where id='delayed_key'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let plan: String = sqlx::query_scalar("select id from subscription_plans where is_base")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    let policy = ClientBillingPolicy::for_plan(
+        SubscriptionId::new(plan).unwrap(),
+        None,
+        UserBudgetLimits::default(),
+        "2".parse().unwrap(),
+        None,
+    );
+    let completed: DateTime<Utc> = "2026-01-14T15:59:59Z".parse().unwrap();
+    let store = PgClientBudgetStore::new(database.pool.clone());
+    let charge = UserBudgetCharge {
+        user_id: UserId::new("delayed_user").unwrap(),
+        key_id: key_id("delayed_key"),
+        request_id: ModelRequestId::new("req_delayed_old").unwrap(),
+        base_amount_usd: Some("1".parse().unwrap()),
+        policy,
+        completed_at: completed.into(),
+    };
+    store.settle_user(charge.clone()).await.unwrap();
+    let first: (String,DateTime<Utc>) = sqlx::query_as("select daily_used_usd::text,daily_end from user_budget_windows where user_id='delayed_user'").fetch_one(&database.pool).await.unwrap();
+    assert_eq!(
+        first
+            .0
+            .parse::<gateway_core::metering::Decimal>()
+            .unwrap()
+            .canonical(),
+        "2"
+    );
+    assert_eq!(
+        first.1,
+        "2026-01-14T16:00:00Z".parse::<DateTime<Utc>>().unwrap()
+    );
+    store
+        .settle_user(UserBudgetCharge {
+            request_id: ModelRequestId::new("req_delayed_new").unwrap(),
+            completed_at: (completed + chrono::Duration::seconds(2)).into(),
+            ..charge.clone()
+        })
+        .await
+        .unwrap();
+    store
+        .settle_user(UserBudgetCharge {
+            request_id: ModelRequestId::new("req_delayed_late").unwrap(),
+            ..charge
+        })
+        .await
+        .unwrap();
+    let next: (String,DateTime<Utc>) = sqlx::query_as("select daily_used_usd::text,daily_end from user_budget_windows where user_id='delayed_user'").fetch_one(&database.pool).await.unwrap();
+    assert_eq!(
+        next.0
+            .parse::<gateway_core::metering::Decimal>()
+            .unwrap()
+            .canonical(),
+        "2",
+        "old completion must not be charged against a later day"
+    );
+    assert_eq!(next.1, first.1 + chrono::Duration::days(1));
+    let count: i64 =
+        sqlx::query_scalar("select count(*) from user_charge_events where user_ref='delayed_user'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 3, "all historical charges are preserved");
     database.close().await;
 }

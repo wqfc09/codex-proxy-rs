@@ -111,6 +111,7 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
         Arc::new(AuthStoreAdapter {
             keys: postgres::PgAdminClientKeyStore::new(pool.clone()),
             security: postgres::PgAdminSecurityAuditRepository::new(pool.clone()),
+            identity: postgres::PgIdentityRepository::new(pool.clone()),
             settings: postgres::PgRuntimeSettingsRepository::new(pool.clone()),
             state: redis::RedisAuthStateRepository::new(redis_connection.clone(), REDIS_NAMESPACE)?,
         }),
@@ -125,7 +126,10 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
             control_plane: postgres::PgControlPlaneRepository::new(pool.clone()),
         }),
         backup_ports(pool.clone(), &config)?,
-    );
+    )
+    .with_subscription_billing(Arc::new(postgres::PgSubscriptionBillingStore::new(
+        pool.clone(),
+    )));
 
     let execution_repository = Arc::new(postgres::PgExecutionStore::new(pool.clone()));
     let (execution, execution_writer) =

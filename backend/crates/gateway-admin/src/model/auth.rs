@@ -1,7 +1,7 @@
 //! 控制面认证、统一会话和管理员安全审计事实。
 
 use chrono::{DateTime, Utc};
-use gateway_core::{engine::execution::ClientAuthenticationError, policy::ClientApiKeyId};
+use gateway_core::policy::ClientApiKeyId;
 
 use super::{MutationActor, MutationContext, Revision};
 
@@ -41,31 +41,20 @@ impl AdminRequestContext {
     }
 }
 
-/// 登录方式只决定凭据验证流程，不能直接授予会话权限。
+/// Account/User 密码登录命令；浏览器 API 不接受 Client Key 身份。
 #[derive(Clone, PartialEq, Eq)]
-pub enum LoginCommand {
-    Admin {
-        username: Option<String>,
-        password: String,
-    },
-    Key {
-        api_key: String,
-    },
+pub struct LoginCommand {
+    pub username: Option<String>,
+    pub password: String,
 }
 
 impl std::fmt::Debug for LoginCommand {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Admin { username, .. } => formatter
-                .debug_struct("AdminLogin")
-                .field("username", username)
-                .field("password", &"[REDACTED]")
-                .finish(),
-            Self::Key { .. } => formatter
-                .debug_struct("KeyLogin")
-                .field("api_key", &"[REDACTED]")
-                .finish(),
-        }
+        formatter
+            .debug_struct("AccountLogin")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -97,20 +86,15 @@ pub enum LoginError {
     Unavailable,
 }
 
-impl From<ClientAuthenticationError> for LoginError {
-    fn from(error: ClientAuthenticationError) -> Self {
-        match error {
-            ClientAuthenticationError::InvalidKey => Self::InvalidCredentials,
-            ClientAuthenticationError::SnapshotUnavailable => Self::Unavailable,
-        }
-    }
-}
-
 /// 服务端已验证的身份绑定，不保存密码或原始 API Key。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionSubject {
     Admin {
         admin_user_id: String,
+        credential_fingerprint: String,
+    },
+    User {
+        user_id: String,
         credential_fingerprint: String,
     },
     Key {
@@ -130,7 +114,7 @@ impl std::fmt::Debug for ChangePassword {
     }
 }
 
-/// 两种登录方式共用的固定有效期会话。
+/// 认证主体共用的固定有效期会话；Key 仅供兼容的内部 KeyUsage 流程使用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthSession {
     pub subject: SessionSubject,
@@ -140,6 +124,7 @@ pub struct AuthSession {
 /// 安全审计事件类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditActorKind {
+    UserSession,
     AdminSession,
     AdminApiKey,
     System,

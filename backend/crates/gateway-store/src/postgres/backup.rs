@@ -428,6 +428,7 @@ impl BackupRepository for PgBackupRepository {
         &self,
         now: DateTime<Utc>,
     ) -> AdminStoreResult<Option<BackupRecord>> {
+        // 创建时间来自数据库、调用时间来自应用；时钟偏差不能让生命周期倒退。
         sqlx::query(
             "with claimed as (
                select backup_records.id from backup_records
@@ -438,10 +439,10 @@ impl BackupRepository for PgBackupRepository {
              )
              update backup_records br
                 set status = 'dumping',
-                    started_at = $1,
+                    started_at = greatest($1, br.created_at),
                     completed_at = null,
                     attempt_count = br.attempt_count + 1,
-                    updated_at = $1
+                    updated_at = greatest($1, br.created_at)
                from claimed
               where br.id = claimed.id
               returning br.id, br.trigger_kind, br.status, br.scheduled_at, br.object_key,
@@ -477,11 +478,14 @@ impl BackupRepository for PgBackupRepository {
                     sha256 = coalesce($3, sha256),
                     error_code = coalesce($4, error_code),
                     error_message = coalesce($5, error_message),
-                    completed_at = coalesce(
-                        $6,
-                        case when $1 in ('completed', 'failed') then $7 else completed_at end
-                    ),
-                    updated_at = $7
+                    completed_at = case
+                        when $6 is not null
+                          then greatest($6, coalesce(started_at, created_at), created_at)
+                        when $1 in ('completed', 'failed')
+                          then greatest($7, coalesce(started_at, created_at), created_at)
+                        else completed_at
+                    end,
+                    updated_at = greatest($7, updated_at, created_at)
               where id = $8 and status = $9
               returning id, trigger_kind, status, scheduled_at, object_key, size_bytes, sha256,
                         attempt_count, error_code, error_message, started_at, completed_at, expires_at,
@@ -510,7 +514,8 @@ impl BackupRepository for PgBackupRepository {
     ) -> AdminStoreResult<Option<BackupRecord>> {
         sqlx::query(
             "update backup_records
-                set status = 'deleting', updated_at = $1
+                set status = 'deleting',
+                    updated_at = greatest($1, updated_at, completed_at, created_at)
               where id = $2 and status in ('completed', 'failed')
               returning id, trigger_kind, status, scheduled_at, object_key, size_bytes, sha256,
                         attempt_count, error_code, error_message, started_at, completed_at, expires_at,

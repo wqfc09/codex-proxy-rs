@@ -14,8 +14,9 @@ use uuid::Uuid;
 use crate::concurrency::{CapacityWait, ConcurrencyWaitBudget, ConcurrencyWaitQueue};
 use crate::engine::admission::{
     ClientAdmissionDecision, ClientAdmissionPort, ClientAdmissionRejection, ClientAdmissionRequest,
+    UserAdmissionScope,
 };
-use crate::engine::budget::{ClientBudgetCharge, ClientBudgetPort};
+use crate::engine::budget::{ClientBudgetCharge, ClientBudgetPort, UserBudgetCharge};
 use crate::engine::continuation::{
     ContinuationBinding, NativeContinuationPin, NativeContinuationPort,
     NativeContinuationStoreErrorKind, PreviousResponseId,
@@ -36,7 +37,7 @@ use crate::event::{GatewayEvent, ProviderEvent, ProviderResponseHeader};
 use crate::identity::ProviderKind;
 use crate::lifecycle::CancellationToken;
 use crate::operation::{Operation, ProviderSessionState};
-use crate::policy::{ClientApiKeyId, ClientPolicy};
+use crate::policy::{ClientApiKeyId, ClientPolicy, UserId};
 use crate::routing::{
     ProviderCatalogUnavailable, PublicModelDescriptor, PublicModelId, RoutingContext,
     RuntimeSnapshot, UpstreamModelId,
@@ -535,8 +536,21 @@ impl DefaultExecutionService {
             .acquire_client_admission(&client, &request_id, deadline_at, &concurrency_wait_budget)
             .await?;
         let admission_decision_ms = duration_ms(admission_started_at.elapsed());
+        let user_billing_policy = client
+            .policy
+            .billing_policy()
+            .and_then(|policy| policy.effective_at(SystemTime::now()));
         if let Some(budget) = &self.budget
             && let Err(error) = budget.admit(client.policy.key_id().clone()).await
+        {
+            admission.release().await;
+            return Err(error);
+        }
+        if let (Some(user_id), Some(billing_policy), Some(budget)) = (
+            client.policy.user_id().cloned(),
+            user_billing_policy.clone(),
+            &self.budget,
+        ) && let Err(error) = budget.admit_user(user_id, billing_policy).await
         {
             admission.release().await;
             return Err(error);
@@ -555,6 +569,21 @@ impl DefaultExecutionService {
             id: request_id.clone(),
             client_api_key_id: Some(client.policy.key_id().clone()),
             client_api_key_ref: client.policy.key_id().clone(),
+            user_id: client.policy.user_id().cloned(),
+            plan_id: user_billing_policy
+                .as_ref()
+                .map(|policy| policy.plan_id().clone()),
+            subscription_id: user_billing_policy
+                .as_ref()
+                .and_then(|policy| policy.subscription_id().cloned()),
+            downstream_rate_multiplier: user_billing_policy
+                .as_ref()
+                .map(|policy| policy.downstream_rate_multiplier()),
+            username_snapshot: client.policy.username_snapshot().map(str::to_owned),
+            client_api_key_name_snapshot: client
+                .policy
+                .client_api_key_name_snapshot()
+                .map(str::to_owned),
             config_revision: plan.config_revision(),
             routing: client.policy.account_scope().routing_snapshot(),
             protocol: metadata.protocol,
@@ -589,7 +618,9 @@ impl DefaultExecutionService {
         {
             Ok(core) => core.with_concurrency_wait_budget(concurrency_wait_budget),
             Err(error) => {
-                if let Some(budget) = &self.budget {
+                if client.policy.user_id().is_none()
+                    && let Some(budget) = &self.budget
+                {
                     settle_budget(
                         budget.as_ref(),
                         ClientBudgetCharge {
@@ -615,6 +646,8 @@ impl DefaultExecutionService {
                 Arc::clone(&self.circuits),
                 Arc::clone(&self.continuation),
                 self.budget.clone(),
+                client.policy.user_id().cloned(),
+                user_billing_policy,
             )),
         })
     }
@@ -627,13 +660,14 @@ impl DefaultExecutionService {
         budget: &ConcurrencyWaitBudget,
     ) -> Result<AdmissionLease, GatewayError> {
         let policy = client.snapshot.client_queue_policy();
-        let limits = client.policy.limits();
-        let key = client.policy.key_id();
+        let (limits, user) = admission_scope(client)?;
+        let key = client.policy.key_id().clone();
         let mut waiting = CapacityWait::new(&self.admission_waiting, policy, deadline_at, budget);
         let mut admission = AdmissionLease {
             port: Arc::clone(&self.admissions),
             client_api_key_id: key.clone(),
             model_request_id: request_id.clone(),
+            user_id: user.as_ref().map(|scope| scope.user_id.clone()),
             armed: false,
         };
         loop {
@@ -654,8 +688,9 @@ impl DefaultExecutionService {
                     model_request_id: request_id.clone(),
                     client_api_key_id: key.clone(),
                     lease_ttl: remaining,
-                    allow_concurrency_acquire: limits.max_concurrency == 0 || waiting.can_try(key),
+                    allow_concurrency_acquire: limits.max_concurrency == 0 || waiting.can_try(&key),
                     limits,
+                    user: user.clone(),
                 })
                 .fuse();
             let timeout = Delay::new(remaining).fuse();
@@ -678,18 +713,24 @@ impl DefaultExecutionService {
                 }
                 ClientAdmissionDecision::Rejected(reason) => {
                     admission.armed = false;
-                    if reason == ClientAdmissionRejection::RateLimited || policy.max_waiting == 0 {
+                    if reason == ClientAdmissionRejection::RateLimited {
                         return Err(GatewayError::new(
                             GatewayErrorKind::RateLimited,
-                            "request exceeds client API key limits",
+                            "request exceeds client API key rate limits",
+                        ));
+                    }
+                    if policy.max_waiting == 0 {
+                        return Err(GatewayError::new(
+                            GatewayErrorKind::ConcurrencyLimited,
+                            "request exceeds client API key concurrency limit",
                         ));
                     }
                     if waiting.elapsed().is_zero()
                         && let Some(budget) = &self.budget
                     {
-                        budget.admit(key.clone()).await?;
+                        budget.admit(client.policy.key_id().clone()).await?;
                     }
-                    waiting.wait(std::slice::from_ref(key)).await.map_err(|error| {
+                    waiting.wait(std::slice::from_ref(&key)).await.map_err(|error| {
                         tracing::info!(request_id = request_id.as_str(), queue_layer = "client_key", queue_wait_ms = duration_ms(waiting.elapsed()), reason = %error, "Key 排队请求被拒绝");
                         error.gateway_error()
                     })?;
@@ -790,6 +831,12 @@ impl DefaultExecutionService {
             id: request_id,
             client_api_key_id: None,
             client_api_key_ref: actor,
+            user_id: None,
+            plan_id: None,
+            subscription_id: None,
+            downstream_rate_multiplier: None,
+            username_snapshot: None,
+            client_api_key_name_snapshot: None,
             config_revision: plan.config_revision(),
             routing: crate::routing::AccountRoutingSnapshot::all(),
             protocol: "admin_connection_test".to_owned(),
@@ -1123,6 +1170,38 @@ struct AdmissionLease {
     port: Arc<dyn ClientAdmissionPort>,
     client_api_key_id: ClientApiKeyId,
     model_request_id: ModelRequestId,
+    user_id: Option<UserId>,
+}
+
+fn admission_scope(
+    client: &AuthenticatedClient,
+) -> Result<(crate::policy::RateLimits, Option<UserAdmissionScope>), GatewayError> {
+    if let Some(user_id) = client.policy.user_id() {
+        let user_limits = client.policy.user_rate_limits();
+        if user_limits.max_concurrency.is_some_and(|limit| limit == 0) {
+            return Err(GatewayError::new(
+                GatewayErrorKind::ConcurrencyLimited,
+                "user concurrency limit rejects this request",
+            ));
+        }
+        if user_limits
+            .requests_per_minute
+            .is_some_and(|limit| limit == 0)
+        {
+            return Err(GatewayError::new(
+                GatewayErrorKind::RateLimited,
+                "user request rate limit rejects this request",
+            ));
+        }
+        return Ok((
+            client.policy.limits(),
+            Some(UserAdmissionScope {
+                user_id: user_id.clone(),
+                limits: user_limits,
+            }),
+        ));
+    }
+    Ok((client.policy.limits(), None))
 }
 
 async fn settle_budget(port: &dyn ClientBudgetPort, charge: ClientBudgetCharge) {
@@ -1131,11 +1210,21 @@ async fn settle_budget(port: &dyn ClientBudgetPort, charge: ClientBudgetCharge) 
     }
 }
 
+async fn settle_user_budget(port: &dyn ClientBudgetPort, charge: UserBudgetCharge) {
+    if let Err(error) = port.settle_user(charge).await {
+        tracing::error!(%error, "User budget settlement failed; storage will retry on the next request");
+    }
+}
+
 impl AdmissionLease {
     async fn release(mut self) {
         if let Err(error) = self
             .port
-            .release(&self.client_api_key_id, &self.model_request_id)
+            .release_scoped(
+                &self.client_api_key_id,
+                self.user_id.as_ref(),
+                &self.model_request_id,
+            )
             .await
         {
             tracing::warn!(%error, "Client admission 释放失败，依赖租约 TTL 收敛");
@@ -1147,8 +1236,11 @@ impl AdmissionLease {
 impl Drop for AdmissionLease {
     fn drop(&mut self) {
         if self.armed {
-            self.port
-                .abandon(&self.client_api_key_id, &self.model_request_id);
+            self.port.abandon_scoped(
+                &self.client_api_key_id,
+                self.user_id.as_ref(),
+                &self.model_request_id,
+            );
         }
     }
 }
@@ -1162,6 +1254,8 @@ struct DefaultExecutionSession {
     observed_provider_outcomes: usize,
     continuation_recorded: bool,
     budget: Option<Arc<dyn ClientBudgetPort>>,
+    user_id: Option<UserId>,
+    billing_policy: Option<crate::policy::ClientBillingPolicy>,
 }
 
 impl DefaultExecutionSession {
@@ -1171,6 +1265,8 @@ impl DefaultExecutionSession {
         circuits: Arc<dyn ProviderCircuitPort>,
         continuation: Arc<dyn NativeContinuationPort>,
         budget: Option<Arc<dyn ClientBudgetPort>>,
+        user_id: Option<UserId>,
+        billing_policy: Option<crate::policy::ClientBillingPolicy>,
     ) -> Self {
         Self {
             core,
@@ -1181,6 +1277,8 @@ impl DefaultExecutionSession {
             observed_provider_outcomes: 0,
             continuation_recorded: false,
             budget,
+            user_id,
+            billing_policy,
         }
     }
 
@@ -1190,11 +1288,34 @@ impl DefaultExecutionSession {
         {
             let budget = self.budget.take();
             let charge = self.core.budget_charge();
+            let key_id = charge.key_id.clone();
+            let request_id = charge.request_id.clone();
+            let completed_at = charge.completed_at;
+            let base_amount_usd = self.core.budget_cost();
+            let user_id = self.user_id.take();
+            let billing_policy = self.billing_policy.take();
+            let owned_user = user_id.is_some();
             // 在首次 await 前把完整清理责任留在会话内。事件等待被取消后，后续 poll
             // 或 detach 继续同一个 future，既不丢失费用，也不重启已完成的结算。
             self.cleanup = Some(Box::pin(async move {
                 if let Some(budget) = budget {
-                    settle_budget(budget.as_ref(), charge).await;
+                    if !owned_user {
+                        settle_budget(budget.as_ref(), charge).await;
+                    }
+                    if let (Some(user_id), Some(policy)) = (user_id, billing_policy) {
+                        settle_user_budget(
+                            budget.as_ref(),
+                            UserBudgetCharge {
+                                user_id,
+                                key_id,
+                                request_id,
+                                base_amount_usd,
+                                policy,
+                                completed_at,
+                            },
+                        )
+                        .await;
+                    }
                 }
                 admission.release().await;
             }));

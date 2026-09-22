@@ -423,6 +423,68 @@ impl AdminObservabilityStore for PgAdminObservabilityStore {
         admin_usage_detail(detail)
     }
 
+    async fn list_user_usage_records(
+        &self,
+        user_id: &str,
+        query: admin_observability::UserUsageQuery,
+    ) -> AdminStoreResult<admin_observability::UserUsagePage> {
+        require_nonempty("user usage", "user ID", user_id).map_err(observability_error)?;
+        let query = store_user_usage_query(user_id, query)?;
+        let page = self
+            .repository
+            .query_budget
+            .run(
+                "list user usage records",
+                list_user_usage_records(&self.repository.pool, query),
+            )
+            .await
+            .map_err(observability_error)?;
+        admin_user_usage_page(page)
+    }
+
+    async fn user_usage_record_detail(
+        &self,
+        user_id: &str,
+        request_id: &str,
+    ) -> AdminStoreResult<admin_observability::UserUsageRecord> {
+        require_nonempty("user usage", "user ID", user_id)
+            .and_then(|()| require_nonempty("user usage", "request ID", request_id))
+            .map_err(observability_error)?;
+        let record = self
+            .repository
+            .query_budget
+            .run(
+                "load user usage record detail",
+                user_usage_record_detail(&self.repository.pool, user_id, request_id),
+            )
+            .await
+            .map_err(observability_error)?;
+        admin_user_usage_record(record)
+    }
+
+    async fn user_usage_summary(
+        &self,
+        user_id: &str,
+        range: admin_observability::TimeRange,
+        filter: admin_observability::UserUsageFilter,
+    ) -> AdminStoreResult<admin_observability::UserUsageSummary> {
+        require_nonempty("user usage", "user ID", user_id).map_err(observability_error)?;
+        let summary = self
+            .repository
+            .query_budget
+            .run(
+                "load user usage summary",
+                user_usage_summary(
+                    &self.repository.pool,
+                    store_range(range)?,
+                    store_user_usage_filter(user_id, filter),
+                ),
+            )
+            .await
+            .map_err(observability_error)?;
+        admin_user_usage_summary(summary)
+    }
+
     async fn usage_summary(
         &self,
         range: admin_observability::TimeRange,

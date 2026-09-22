@@ -12,7 +12,10 @@ use axum::{
 };
 use gateway_admin::{
     AdminServices,
-    model::auth::{AuthSession, ChangePassword, LoginCommand, LoginError, SessionSubject},
+    model::{
+        auth::{AuthSession, ChangePassword, LoginCommand, LoginError, SessionSubject},
+        users::{LoginProtectionProof, UserRole},
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,16 +30,11 @@ pub trait SessionState {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
-pub enum LoginRequest {
-    Admin {
-        username: Option<String>,
-        password: String,
-    },
-    Key {
-        #[serde(rename = "apiKey")]
-        api_key: String,
-    },
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoginRequest {
+    username: String,
+    password: String,
+    turnstile_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -54,27 +52,32 @@ impl fmt::Debug for ChangePasswordRequest {
 
 impl fmt::Debug for LoginRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Admin { username, .. } => formatter
-                .debug_struct("AdminLogin")
-                .field("username", username)
-                .field("password", &"[REDACTED]")
-                .finish(),
-            Self::Key { .. } => formatter
-                .debug_struct("KeyLogin")
-                .field("api_key", &"[REDACTED]")
-                .finish(),
-        }
+        formatter
+            .debug_struct("LoginRequest")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field(
+                "turnstile_token",
+                &self.turnstile_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
     }
 }
 
 impl From<LoginRequest> for LoginCommand {
     fn from(request: LoginRequest) -> Self {
-        match request {
-            LoginRequest::Admin { username, password } => Self::Admin { username, password },
-            LoginRequest::Key { api_key } => Self::Key { api_key },
+        Self {
+            username: Some(request.username),
+            password: request.password,
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicAuthConfigView {
+    turnstile_enabled: bool,
+    turnstile_site_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,8 +92,18 @@ impl From<&AuthSession> for SessionData {
         Self {
             role: match session.subject {
                 SessionSubject::Admin { .. } => "admin",
+                SessionSubject::User { .. } => "user",
                 SessionSubject::Key { .. } => "key",
             },
+            expires_at: session.expires_at.to_rfc3339(),
+        }
+    }
+}
+
+impl SessionData {
+    fn from_user(role: UserRole, session: &AuthSession) -> Self {
+        Self {
+            role: role.as_str(),
             expires_at: session.expires_at.to_rfc3339(),
         }
     }
@@ -112,6 +125,7 @@ where
     S: SessionState + Clone + Send + Sync + 'static,
 {
     Router::new()
+        .route("/api/auth/config", get(auth_config::<S>))
         .route("/api/auth/login", post(login::<S>))
         .route("/api/auth/status", get(session_status::<S>))
         .route("/api/auth/logout", post(logout::<S>))
@@ -120,6 +134,25 @@ where
         .route("/api/auth/{*path}", any(not_found))
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::map_response(no_store))
+}
+
+async fn auth_config<S>(State(state): State<S>) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let settings = state
+        .admin_services()
+        .auth()
+        .public_auth_settings()
+        .await
+        .map_err(map_admin_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(PublicAuthConfigView {
+            turnstile_enabled: settings.turnstile_enabled,
+            turnstile_site_key: settings.turnstile_site_key,
+        }),
+    ))
 }
 
 async fn login<S>(
@@ -131,12 +164,16 @@ async fn login<S>(
 where
     S: SessionState + Send + Sync,
 {
+    let protection = LoginProtectionProof {
+        token: payload.turnstile_token.clone(),
+        remote_ip: Some(peer.ip()),
+    };
     let result = state
         .admin_services()
         .auth()
-        .login(
+        .login_with_protection(
             payload.into(),
-            peer.ip(),
+            protection,
             session_cookie::value(&headers).as_deref(),
         )
         .await
@@ -176,17 +213,29 @@ async fn session_status<S>(
 where
     S: SessionState + Send + Sync,
 {
-    let session = state
+    let session_id = session_cookie::value(&headers);
+    let user = state
         .admin_services()
         .auth()
-        .session(session_cookie::value(&headers).as_deref())
+        .resolve_user(session_id.as_deref())
         .await
         .map_err(map_admin_service_error)?;
+    let session = if let Some(user) = user {
+        state
+            .admin_services()
+            .auth()
+            .session(session_id.as_deref())
+            .await
+            .map_err(map_admin_service_error)?
+            .map(|session| SessionData::from_user(user.role, &session))
+    } else {
+        None
+    };
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(SessionStatusData {
             authenticated: session.is_some(),
-            session: session.as_ref().map(SessionData::from),
+            session,
         }),
     ))
 }

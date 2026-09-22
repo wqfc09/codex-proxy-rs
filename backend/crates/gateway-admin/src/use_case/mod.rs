@@ -10,9 +10,12 @@ pub mod import_tasks;
 pub mod key_usage;
 pub mod observability;
 pub mod openai;
+pub mod password;
 pub mod proxies;
 pub mod settings;
+pub mod subscription_billing;
 pub mod system;
+pub mod users;
 pub mod xai;
 
 use std::sync::Arc;

@@ -10,6 +10,7 @@ const ENTITY: &str = "admin audit event";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminAuditActorKind {
+    UserSession,
     AdminSession,
     AdminApiKey,
     System,
@@ -20,6 +21,7 @@ impl AdminAuditActorKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::UserSession => "user_session",
             Self::AdminSession => "admin_session",
             Self::AdminApiKey => "admin_api_key",
             Self::System => "system",

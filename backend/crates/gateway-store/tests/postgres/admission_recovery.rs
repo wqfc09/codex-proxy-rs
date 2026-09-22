@@ -75,9 +75,74 @@ async fn recovery_loads_precise_window_and_running_request_facts() {
                 deadline_at: now + Duration::seconds(40),
             },
         ],
+        user: None,
     }];
     assert_eq!(actual, expected);
 
+    database.close().await;
+}
+
+#[tokio::test]
+async fn recovery_uses_frozen_request_user_after_owned_key_deletion() {
+    let Some(database) = TestDatabase::create("admission_recovery_deleted_key").await else {
+        return;
+    };
+    let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+        .expect("current time is representable at PostgreSQL precision");
+    let window_started_at = now - Duration::seconds(60);
+    sqlx::query(
+        "insert into users (id, username, password_hash, role, enabled, created_at, updated_at)
+         values ('recovery_shared_user', 'recovery_shared_user', 'hash', 'user', true, now(), now())",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    for key in ["recovery-key-a", "recovery-key-b"] {
+        sqlx::query(
+            "insert into client_api_keys (id, name, key, owner_user_id, created_at, updated_at)
+             values ($1, $1, $2, 'recovery_shared_user', now(), now())",
+        )
+        .bind(key)
+        .bind(format!("sk_{key:a<43}"))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    }
+    seed_owned_request(
+        &database.pool,
+        "deleted-key-running",
+        "recovery-key-a",
+        "recovery_shared_user",
+        now - Duration::seconds(10),
+        now + Duration::seconds(30),
+    )
+    .await;
+    seed_owned_request(
+        &database.pool,
+        "live-key-running",
+        "recovery-key-b",
+        "recovery_shared_user",
+        now - Duration::seconds(5),
+        now + Duration::seconds(35),
+    )
+    .await;
+    sqlx::query("delete from client_api_keys where id='recovery-key-a'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+    let repository = PgClientAdmissionRecoveryRepository::new(database.pool.clone());
+    let actual = repository
+        .load_client_admission_recovery(window_started_at)
+        .await
+        .expect("load recovery facts after key deletion");
+    assert_eq!(actual.len(), 2);
+    for recovery in actual {
+        let user = recovery.user.expect("frozen request User recovery");
+        assert_eq!(user.user_id, "recovery_shared_user");
+        assert_eq!(user.recent_requests.len(), 1);
+        assert_eq!(user.running_requests.len(), 1);
+    }
     database.close().await;
 }
 
@@ -109,4 +174,33 @@ async fn seed_request(
     .execute(pool)
     .await
     .expect("seed model request recovery fact");
+}
+
+async fn seed_owned_request(
+    pool: &PgPool,
+    id: &str,
+    key: &str,
+    user_id: &str,
+    started_at: DateTime<Utc>,
+    deadline_at: DateTime<Utc>,
+) {
+    sqlx::query(
+        "insert into model_requests (
+           id, client_api_key_ref, user_id, config_revision, protocol, operation, endpoint,
+           client_transport, requested_model_id, outcome, started_at, deadline_at,
+           routing_scope, routing_group_refs, routing_group_names_snapshot
+         ) values (
+           $1, $2, $3, 1, 'openai', 'responses', '/v1/responses',
+           'http_sse', 'coding', 'running', $4, $5,
+           'all', '{}'::text[], '[]'::jsonb
+         )",
+    )
+    .bind(id)
+    .bind(key)
+    .bind(user_id)
+    .bind(started_at)
+    .bind(deadline_at)
+    .execute(pool)
+    .await
+    .expect("seed owned model request recovery fact");
 }

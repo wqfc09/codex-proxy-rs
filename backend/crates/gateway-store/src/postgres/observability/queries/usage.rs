@@ -11,6 +11,10 @@ pub(crate) fn push_usage_filter(
     filter: &UsageRecordFilter,
     alias: &str,
 ) {
+    if let Some(value) = &filter.user_id {
+        query.push(format!(" and {alias}.user_id = "));
+        query.push_bind(value.clone());
+    }
     if let Some(value) = &filter.client_api_key_ref {
         query.push(format!(" and {alias}.client_api_key_ref = "));
         query.push_bind(value.clone());
@@ -83,6 +87,7 @@ pub(crate) fn push_usage_filter(
         query.push(format!(" and ({alias}.id like "));
         query.push_bind(pattern.clone());
         for column in [
+            "username_snapshot",
             "client_api_key_ref",
             "provider_account_ref",
             "provider_account_email_snapshot",
@@ -124,7 +129,9 @@ pub(crate) fn literal_prefix_pattern(value: &str) -> String {
 }
 
 pub(crate) const USAGE_LIST_RECORD_SELECT: &str =
-    "select mr.id, client_key.name as client_api_key_name, mr.endpoint, mr.client_transport, mr.requested_model_id,
+    "select mr.id, mr.user_id, mr.username_snapshot as username,
+            coalesce(client_key.name, mr.client_api_key_name_snapshot) as client_api_key_name,
+            mr.endpoint, mr.client_transport, mr.requested_model_id,
             mr.provider_kind, mr.provider_account_ref,
             mr.provider_account_name_snapshot as provider_account_name,
             mr.provider_account_email_snapshot as provider_account_email,
@@ -147,7 +154,7 @@ pub(crate) const USAGE_LIST_RECORD_SELECT: &str =
      left join provider_accounts account on account.id = mr.provider_account_ref";
 
 pub(crate) const USAGE_RECORD_DETAIL_SELECT: &str =
-    "select mr.id, mr.client_api_key_ref, mr.config_revision,
+    "select mr.id, mr.user_id, mr.username_snapshot as username, mr.client_api_key_ref, mr.config_revision,
             mr.routing_scope, mr.routing_group_refs, mr.routing_group_names_snapshot,
             mr.protocol, mr.operation,
             mr.endpoint, mr.client_transport, mr.requested_model_id,
@@ -238,6 +245,316 @@ pub(crate) async fn count_usage_records(
         .await
         .map_err(|_| postgres_unavailable("count usage records"))?;
     to_u64(total)
+}
+
+const USER_USAGE_RECORD_SELECT: &str = "select mr.id, mr.client_api_key_ref,
+            coalesce(current_key.name, mr.client_api_key_name_snapshot, '未命名密钥') as client_api_key_name,
+            mr.operation, mr.request_kind, mr.requested_model_id,
+            mr.input_tokens, mr.output_tokens, mr.cached_tokens, mr.cache_write_tokens,
+            mr.reasoning_tokens, mr.image_input_tokens, mr.image_output_tokens, mr.total_tokens,
+            mr.downstream_rate_multiplier::text, mr.downstream_billed_amount::text,
+            mr.outcome, mr.client_status_code, mr.latency_ms,
+            mr.started_at, mr.completed_at
+     from model_requests mr
+     left join client_api_keys current_key
+       on current_key.id = mr.client_api_key_ref and current_key.owner_user_id = mr.user_id";
+
+fn require_user_usage_scope(filter: &UsageRecordFilter) -> StoreResult<()> {
+    filter.validate()?;
+    if filter.user_id.as_deref().is_none_or(str::is_empty) {
+        return Err(invalid(
+            "user usage query requires authenticated user scope",
+        ));
+    }
+    Ok(())
+}
+
+fn push_user_usage_filter(
+    query: &mut QueryBuilder<Postgres>,
+    filter: &UsageRecordFilter,
+    alias: &str,
+) {
+    push_usage_filter(query, filter, alias);
+    if let (Some(user_id), Some(key_id)) = (&filter.user_id, &filter.client_api_key_ref) {
+        // 当前 Key 存在时必须仍归属于认证用户；已删除 Key 只能按请求快照中的 user_id 解释历史。
+        query.push(
+            " and (not exists (select 1 from client_api_keys selected_key where selected_key.id = ",
+        );
+        query.push_bind(key_id.clone());
+        query.push(" ) or exists (select 1 from client_api_keys owned_key where owned_key.id = ");
+        query.push_bind(key_id.clone());
+        query.push(" and owned_key.owner_user_id = ");
+        query.push_bind(user_id.clone());
+        query.push("))");
+    }
+}
+
+pub(crate) async fn list_user_usage_records(
+    pool: &PgPool,
+    query: UsageRecordQuery,
+) -> StoreResult<UserUsageRecordPage> {
+    require_user_usage_scope(&query.filter)?;
+    let total = count_user_usage_records(pool, query.range, &query.filter).await?;
+    let offset = observability_page_offset(query.current_page, query.page_size)?;
+    let mut statement = QueryBuilder::<Postgres>::new(USER_USAGE_RECORD_SELECT);
+    statement
+        .push(" where mr.started_at >= ")
+        .push_bind(query.range.start)
+        .push(" and mr.started_at < ")
+        .push_bind(query.range.end);
+    push_completed_usage_fact_filter(&mut statement, "mr");
+    push_user_usage_filter(&mut statement, &query.filter, "mr");
+    statement
+        .push(" order by mr.started_at desc, mr.id desc limit ")
+        .push_bind(i64::from(query.page_size.get()))
+        .push(" offset ")
+        .push_bind(offset);
+    let rows = statement
+        .build()
+        .fetch_all(pool)
+        .await
+        .map_err(|_| postgres_unavailable("list user usage records"))?;
+    let items = rows
+        .iter()
+        .map(user_usage_record_from_row)
+        .collect::<StoreResult<Vec<_>>>()?;
+    Ok(UserUsageRecordPage {
+        items,
+        current_page: query.current_page,
+        page_size: query.page_size.get(),
+        total,
+    })
+}
+
+async fn count_user_usage_records(
+    pool: &PgPool,
+    range: ObservabilityRange,
+    filter: &UsageRecordFilter,
+) -> StoreResult<u64> {
+    require_user_usage_scope(filter)?;
+    let mut statement = QueryBuilder::<Postgres>::new(
+        "select count(*)::bigint from model_requests mr where mr.started_at >= ",
+    );
+    statement
+        .push_bind(range.start)
+        .push(" and mr.started_at < ")
+        .push_bind(range.end);
+    push_completed_usage_fact_filter(&mut statement, "mr");
+    push_user_usage_filter(&mut statement, filter, "mr");
+    let total = statement
+        .build_query_scalar::<i64>()
+        .fetch_one(pool)
+        .await
+        .map_err(|_| postgres_unavailable("count user usage records"))?;
+    to_u64(total)
+}
+
+pub(crate) async fn user_usage_record_detail(
+    pool: &PgPool,
+    user_id: &str,
+    request_id: &str,
+) -> StoreResult<UserUsageRecord> {
+    require_nonempty("user usage", "user ID", user_id)?;
+    require_nonempty("user usage", "request ID", request_id)?;
+    validate_text(user_id, MAX_FILTER_BYTES, "user ID")?;
+    validate_text(request_id, MAX_FILTER_BYTES, "request ID")?;
+    let mut statement = QueryBuilder::<Postgres>::new(USER_USAGE_RECORD_SELECT);
+    statement
+        .push(" where mr.id = ")
+        .push_bind(request_id.to_owned())
+        .push(" and mr.user_id = ")
+        .push_bind(user_id.to_owned());
+    push_completed_usage_fact_filter(&mut statement, "mr");
+    let row = statement
+        .build()
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| postgres_unavailable("load user usage record detail"))?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "user usage record",
+            id: request_id.to_owned(),
+        })?;
+    user_usage_record_from_row(&row)
+}
+
+pub(crate) async fn user_usage_summary(
+    pool: &PgPool,
+    range: ObservabilityRange,
+    filter: UsageRecordFilter,
+) -> StoreResult<UserUsageSummary> {
+    require_user_usage_scope(&filter)?;
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| postgres_unavailable("begin user usage summary"))?;
+    sqlx::query("set transaction isolation level repeatable read, read only")
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| postgres_unavailable("snapshot user usage summary"))?;
+
+    let aggregate = &mut QueryBuilder::<Postgres>::new(
+        "select count(*)::bigint as request_count,
+                count(*) filter (where mr.outcome = 'succeeded')::bigint as success_count,
+                count(*) filter (where mr.outcome <> 'succeeded')::bigint as failure_count,
+                coalesce(sum(mr.input_tokens), 0)::bigint as input_tokens,
+                coalesce(sum(mr.output_tokens), 0)::bigint as output_tokens,
+                coalesce(sum(mr.cached_tokens), 0)::bigint as cached_tokens,
+                floor(avg(mr.latency_ms))::bigint as average_latency_ms,
+                coalesce(sum(mr.total_tokens), 0)::bigint as total_tokens,
+                case when count(*) = 0 then '0' else sum(mr.downstream_billed_amount)::text end as billed_usd,
+                count(mr.downstream_billed_amount)::bigint as billed_known_count,
+                count(*) filter (where mr.downstream_billed_amount is null)::bigint as billed_unknown_count
+         from model_requests mr",
+    );
+    aggregate
+        .push(" where mr.started_at >= ")
+        .push_bind(range.start)
+        .push(" and mr.started_at < ")
+        .push_bind(range.end);
+    push_completed_usage_fact_filter(aggregate, "mr");
+    push_user_usage_filter(aggregate, &filter, "mr");
+    let row = aggregate
+        .build()
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| postgres_unavailable("load user usage summary"))?;
+
+    let daily_sql = "select (date_trunc('day', mr.started_at at time zone 'Asia/Shanghai') at time zone 'Asia/Shanghai') as bucket_start,
+                count(*)::bigint as request_count,
+                count(*) filter (where mr.outcome = 'succeeded')::bigint as success_count,
+                count(*) filter (where mr.outcome <> 'succeeded')::bigint as failure_count,
+                coalesce(sum(mr.total_tokens), 0)::bigint as total_tokens,
+                sum(mr.downstream_billed_amount)::text as billed_usd,
+                count(mr.downstream_billed_amount)::bigint as billed_known_count,
+                count(*) filter (where mr.downstream_billed_amount is null)::bigint as billed_unknown_count
+         from model_requests mr";
+    let mut daily_query = QueryBuilder::<Postgres>::new(daily_sql);
+    daily_query
+        .push(" where mr.started_at >= ")
+        .push_bind(range.start)
+        .push(" and mr.started_at < ")
+        .push_bind(range.end);
+    push_completed_usage_fact_filter(&mut daily_query, "mr");
+    push_user_usage_filter(&mut daily_query, &filter, "mr");
+    daily_query.push(" group by bucket_start order by bucket_start");
+    let daily_rows = daily_query
+        .build()
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|_| postgres_unavailable("load user usage daily trend"))?;
+    let daily = daily_rows
+        .iter()
+        .map(user_usage_daily_point_from_row)
+        .collect::<StoreResult<Vec<_>>>()?;
+    let trend_granularity = if (range.end - range.start).num_hours() <= 36 {
+        "1h"
+    } else {
+        "1d"
+    };
+    let trend = if trend_granularity == "1h" {
+        let hourly_sql = daily_sql.replace("date_trunc('day'", "date_trunc('hour'");
+        let mut hourly = QueryBuilder::<Postgres>::new(hourly_sql);
+        hourly
+            .push(" where mr.started_at >= ")
+            .push_bind(range.start)
+            .push(" and mr.started_at < ")
+            .push_bind(range.end);
+        push_completed_usage_fact_filter(&mut hourly, "mr");
+        push_user_usage_filter(&mut hourly, &filter, "mr");
+        hourly.push(" group by bucket_start order by bucket_start");
+        hourly
+            .build()
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|_| postgres_unavailable("load user usage hourly trend"))?
+            .iter()
+            .map(user_usage_daily_point_from_row)
+            .collect::<StoreResult<Vec<_>>>()?
+    } else {
+        daily.clone()
+    };
+    let (models, client_keys) = user_usage_breakdowns(&mut transaction, range, &filter).await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| postgres_unavailable("finish user usage summary"))?;
+    Ok(UserUsageSummary {
+        range,
+        request_count: to_u64(get::<i64>(&row, "request_count")?)?,
+        success_count: to_u64(get::<i64>(&row, "success_count")?)?,
+        failure_count: to_u64(get::<i64>(&row, "failure_count")?)?,
+        total_tokens: to_u64(get::<i64>(&row, "total_tokens")?)?,
+        billed_usd: optional_decimal(&row, "billed_usd")?,
+        billed_known_count: to_u64(get::<i64>(&row, "billed_known_count")?)?,
+        billed_unknown_count: to_u64(get::<i64>(&row, "billed_unknown_count")?)?,
+        input_tokens: to_u64(get::<i64>(&row, "input_tokens")?)?,
+        output_tokens: to_u64(get::<i64>(&row, "output_tokens")?)?,
+        cached_tokens: to_u64(get::<i64>(&row, "cached_tokens")?)?,
+        average_latency_ms: get::<Option<i64>>(&row, "average_latency_ms")?
+            .map(to_u64)
+            .transpose()?,
+        trend_granularity,
+        trend,
+        daily,
+        models,
+        client_keys,
+    })
+}
+
+async fn user_usage_breakdowns(
+    connection: &mut sqlx::PgConnection,
+    range: ObservabilityRange,
+    filter: &UsageRecordFilter,
+) -> StoreResult<(Vec<UserUsageBreakdown>, Vec<UserUsageBreakdown>)> {
+    let mut query = QueryBuilder::<Postgres>::new(
+        "with scoped as (select mr.id as request_id, mr.started_at, mr.requested_model_id,
+                mr.client_api_key_ref,
+                coalesce(current_key.name, mr.client_api_key_name_snapshot) as client_api_key_name_snapshot,
+                coalesce(mr.total_tokens, 0) as total_tokens from model_requests mr
+         left join client_api_keys current_key
+           on current_key.id = mr.client_api_key_ref and current_key.owner_user_id = mr.user_id",
+    );
+    query
+        .push(" where mr.started_at >= ")
+        .push_bind(range.start)
+        .push(" and mr.started_at < ")
+        .push_bind(range.end);
+    push_completed_usage_fact_filter(&mut query, "mr");
+    push_user_usage_filter(&mut query, filter, "mr");
+    query.push(
+        "), grouped as (
+            select 'model'::text as dimension, requested_model_id as identifier, count(*)::bigint as request_count, sum(total_tokens)::bigint as total_tokens from scoped group by requested_model_id
+            union all
+            select 'key'::text, client_api_key_ref, count(*)::bigint, sum(total_tokens)::bigint from scoped group by client_api_key_ref
+        ), ranked as (select *, row_number() over (partition by dimension order by request_count desc, identifier asc nulls last) as rank from grouped), buckets as (
+            select dimension, case when rank <= 8 then identifier end as identifier, rank > 8 as is_other, sum(request_count)::bigint as request_count, sum(total_tokens)::bigint as total_tokens from ranked group by dimension, case when rank <= 8 then identifier end, rank > 8
+        )
+        select dimension, identifier, is_other, request_count, total_tokens,
+               case when is_other then '其他' when dimension = 'model' then coalesce(identifier, '未记录模型') else coalesce((select nullif(s.client_api_key_name_snapshot, '') from scoped s where s.client_api_key_ref = b.identifier order by s.started_at desc, s.request_id desc limit 1), '未命名密钥') end as name
+        from buckets b order by dimension, is_other, request_count desc, identifier asc nulls last",
+    );
+    let rows = query
+        .build()
+        .fetch_all(connection)
+        .await
+        .map_err(|_| postgres_unavailable("load user usage breakdowns"))?;
+    let mut models = Vec::new();
+    let mut client_keys = Vec::new();
+    for row in &rows {
+        let item = UserUsageBreakdown {
+            id: get(row, "identifier")?,
+            name: get(row, "name")?,
+            request_count: to_u64(get::<i64>(row, "request_count")?)?,
+            total_tokens: to_u64(get::<i64>(row, "total_tokens")?)?,
+            is_other: get(row, "is_other")?,
+        };
+        if get::<String>(row, "dimension")? == "model" {
+            models.push(item);
+        } else {
+            client_keys.push(item);
+        }
+    }
+    Ok((models, client_keys))
 }
 
 pub(crate) async fn usage_record_detail(

@@ -5,7 +5,7 @@ use gateway_store::redis::{
     ClientAdmissionDecision, ClientAdmissionLimits, ClientAdmissionRecentRequest,
     ClientAdmissionRejection, ClientAdmissionRepository, ClientAdmissionRequest,
     ClientAdmissionRestore, ClientAdmissionRestoreResult, ClientAdmissionRunningRequest,
-    RedisClientAdmissionRepository,
+    ClientAdmissionUserRestore, RedisClientAdmissionRepository, UserAdmissionScope,
 };
 use redis::aio::ConnectionManager;
 use uuid::Uuid;
@@ -33,6 +33,7 @@ fn client_admission_restore_rejects_duplicate_request_ids() {
             recent_request("request-1", started_at),
         ],
         running_requests: Vec::new(),
+        user: None,
     };
     assert!(recovery.validate().is_err());
 }
@@ -84,6 +85,7 @@ async fn restore_rebuilds_lost_cache_without_overwriting_new_admission() {
                 redis_now + chrono::Duration::seconds(30),
             ),
         ],
+        user: None,
     };
 
     let restored = repository
@@ -190,6 +192,7 @@ async fn restore_uses_redis_time_for_window_and_running_expiry_boundaries() {
             ),
             running_request("request-live", redis_now + chrono::Duration::seconds(180)),
         ],
+        user: None,
     };
 
     assert_eq!(
@@ -235,6 +238,7 @@ async fn restore_rejects_future_window_fact_without_partial_write() {
             recent_request("request-future", redis_now + chrono::Duration::seconds(10)),
         ],
         running_requests: Vec::new(),
+        user: None,
     };
 
     assert!(
@@ -260,6 +264,7 @@ fn admission_request(
             max_concurrency: 2,
             requests_per_minute: 0,
         },
+        user: None,
     }
 }
 
@@ -385,6 +390,149 @@ async fn queued_admission_checks_rpm_without_consuming_it_or_overtaking_the_head
     assert_eq!(
         repository.admit_client_request(&later).await.unwrap(),
         ClientAdmissionDecision::Rejected(ClientAdmissionRejection::RateLimited)
+    );
+    delete_namespace_keys(&mut connection, &namespace).await;
+}
+
+#[tokio::test]
+async fn user_scope_is_shared_across_keys_and_release_keeps_rpm_history() {
+    let Some((repository, mut connection, namespace)) = repository().await else {
+        return;
+    };
+    let user = UserAdmissionScope {
+        user_id: "user_shared_scope".to_owned(),
+        limits: gateway_core::policy::UserRateLimits {
+            max_concurrency: Some(2),
+            requests_per_minute: Some(1),
+        },
+    };
+    let mut first = admission_request("shared-first", "key-shared-a", Duration::from_secs(30));
+    first.user = Some(user.clone());
+    assert_eq!(
+        repository.admit_client_request(&first).await.unwrap(),
+        ClientAdmissionDecision::Granted
+    );
+    let mut second = admission_request("shared-second", "key-shared-b", Duration::from_secs(30));
+    second.user = Some(user.clone());
+    assert_eq!(
+        repository.admit_client_request(&second).await.unwrap(),
+        ClientAdmissionDecision::Rejected(ClientAdmissionRejection::RateLimited)
+    );
+    assert!(
+        repository
+            .release_client_request_scoped(
+                "key-shared-a",
+                Some("user_shared_scope"),
+                "shared-first",
+            )
+            .await
+            .unwrap()
+    );
+    let mut after_release = admission_request(
+        "shared-after-release",
+        "key-shared-b",
+        Duration::from_secs(30),
+    );
+    after_release.user = Some(user);
+    assert_eq!(
+        repository
+            .admit_client_request(&after_release)
+            .await
+            .unwrap(),
+        ClientAdmissionDecision::Rejected(ClientAdmissionRejection::RateLimited)
+    );
+    delete_namespace_keys(&mut connection, &namespace).await;
+}
+
+#[tokio::test]
+async fn restore_rebuilds_user_scope_shared_across_keys() {
+    let Some((repository, mut connection, namespace)) = repository().await else {
+        return;
+    };
+    let redis_now = redis_now(&mut connection).await;
+    let recovery = ClientAdmissionRestore {
+        client_api_key_ref: "key-recovery-user-a".to_owned(),
+        recent_requests: vec![recent_request(
+            "user-recovered-request",
+            redis_now - chrono::Duration::seconds(1),
+        )],
+        running_requests: vec![running_request(
+            "user-recovered-request",
+            redis_now + chrono::Duration::seconds(30),
+        )],
+        user: Some(ClientAdmissionUserRestore {
+            user_id: "user-recovered".to_owned(),
+            recent_requests: vec![recent_request(
+                "user-recovered-request",
+                redis_now - chrono::Duration::seconds(1),
+            )],
+            running_requests: vec![running_request(
+                "user-recovered-request",
+                redis_now + chrono::Duration::seconds(30),
+            )],
+        }),
+    };
+    assert_eq!(
+        repository
+            .restore_client_admission(&recovery)
+            .await
+            .expect("restore user admission facts"),
+        ClientAdmissionRestoreResult {
+            restored_recent_requests: 1,
+            restored_running_requests: 1,
+        }
+    );
+    let mut next = admission_request(
+        "user-next-key",
+        "key-recovery-user-b",
+        Duration::from_secs(30),
+    );
+    next.limits.requests_per_minute = 0;
+    next.user = Some(UserAdmissionScope {
+        user_id: "user-recovered".to_owned(),
+        limits: gateway_core::policy::UserRateLimits {
+            max_concurrency: Some(1),
+            requests_per_minute: Some(1),
+        },
+    });
+    assert_eq!(
+        repository.admit_client_request(&next).await.unwrap(),
+        ClientAdmissionDecision::Rejected(ClientAdmissionRejection::RateLimited)
+    );
+    delete_namespace_keys(&mut connection, &namespace).await;
+}
+
+#[tokio::test]
+async fn direct_user_admission_preserves_zero_and_unlimited_without_bucket_writes() {
+    let Some((repository, mut connection, namespace)) = repository().await else {
+        return;
+    };
+    let mut request = admission_request("zero-user", "zero-key", Duration::from_secs(30));
+    request.limits = ClientAdmissionLimits {
+        max_concurrency: 0,
+        requests_per_minute: 0,
+    };
+    for (concurrency, rpm, rejection) in [
+        (Some(0), None, ClientAdmissionRejection::ConcurrencyLimited),
+        (None, Some(0), ClientAdmissionRejection::RateLimited),
+    ] {
+        request.user = Some(UserAdmissionScope {
+            user_id: "zero-user".to_owned(),
+            limits: gateway_core::policy::UserRateLimits {
+                max_concurrency: concurrency,
+                requests_per_minute: rpm,
+            },
+        });
+        assert_eq!(
+            repository.admit_client_request(&request).await.unwrap(),
+            ClientAdmissionDecision::Rejected(rejection)
+        );
+        assert!(namespace_keys(&mut connection, &namespace).await.is_empty());
+    }
+    request.user.as_mut().unwrap().limits = gateway_core::policy::UserRateLimits::unlimited();
+    assert_eq!(
+        repository.admit_client_request(&request).await.unwrap(),
+        ClientAdmissionDecision::Granted
     );
     delete_namespace_keys(&mut connection, &namespace).await;
 }

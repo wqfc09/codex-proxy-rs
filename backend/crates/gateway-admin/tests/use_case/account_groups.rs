@@ -211,6 +211,7 @@ fn group_record() -> AccountGroupRecord {
         member_count: 2,
         provider_counts: BTreeMap::from([("openai".to_owned(), 2)]),
         client_key_count: 1,
+        user_count: 1,
         account_summary: AccountGroupAccountSummary {
             available: 0,
             limited: 0,

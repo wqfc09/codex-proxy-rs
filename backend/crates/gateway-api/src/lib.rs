@@ -34,6 +34,7 @@ mod health;
 mod key_usage;
 pub mod openai;
 mod session_cookie;
+pub mod user;
 
 /// API-owned HTTP 与静态资源配置。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -143,6 +144,7 @@ pub fn initialize(
         .merge(openai::router::router())
         .merge(admin::router::<ApiState>())
         .merge(auth::router::<ApiState>())
+        .merge(user::router::<ApiState>())
         .merge(key_usage::router::<ApiState>())
         .fallback_service(ServeDir::new(config.asset_directory).fallback(ServeFile::new(index)));
     if !config.cors_allowed_origins.is_empty() {
@@ -230,6 +232,12 @@ impl ApiState {
     #[must_use]
     pub(crate) const fn health(&self) -> &HealthStatus {
         &self.health
+    }
+}
+
+impl user::UserSessionState for ApiState {
+    fn user_services(&self) -> &AdminServices {
+        &self.admin
     }
 }
 

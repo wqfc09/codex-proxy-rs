@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use futures::future::BoxFuture;
 
-use crate::policy::{ClientApiKeyId, RateLimits};
+use crate::policy::{ClientApiKeyId, RateLimits, UserId, UserRateLimits};
 
 use super::{ExecutionStore, ModelRequestId};
 
@@ -16,6 +16,14 @@ pub struct ClientAdmissionRequest {
     /// 有等待者时只允许队首取得槽位，RPM 仍由原子准入检查。
     pub allow_concurrency_acquire: bool,
     pub limits: RateLimits,
+    /// 同一用户的共享准入事实；Key 层限制仍同时检查。
+    pub user: Option<UserAdmissionScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserAdmissionScope {
+    pub user_id: UserId,
+    pub limits: UserRateLimits,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,10 +51,19 @@ pub struct RunningAdmissionFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserAdmissionRecovery {
+    pub user_id: UserId,
+    pub recent_requests: Vec<RecentAdmissionFact>,
+    pub running_requests: Vec<RunningAdmissionFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAdmissionRecovery {
     pub client_api_key_id: ClientApiKeyId,
     pub recent_requests: Vec<RecentAdmissionFact>,
     pub running_requests: Vec<RunningAdmissionFact>,
+    /// Redis 丢失时恢复同一用户的共享窗口；Key 事实仍按原域恢复。
+    pub user: Option<UserAdmissionRecovery>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -63,6 +80,15 @@ pub trait ClientAdmissionPort: Send + Sync {
     /// 请求 future 被取消时移交幂等释放，具体实现拥有异步清理执行器。
     fn abandon(&self, client_api_key_id: &ClientApiKeyId, model_request_id: &ModelRequestId);
 
+    fn abandon_scoped(
+        &self,
+        client_api_key_id: &ClientApiKeyId,
+        _user_id: Option<&UserId>,
+        model_request_id: &ModelRequestId,
+    ) {
+        self.abandon(client_api_key_id, model_request_id);
+    }
+
     fn admit(
         &self,
         request: ClientAdmissionRequest,
@@ -73,6 +99,15 @@ pub trait ClientAdmissionPort: Send + Sync {
         client_api_key_id: &'a ClientApiKeyId,
         model_request_id: &'a ModelRequestId,
     ) -> BoxFuture<'a, Result<bool, ClientAdmissionError>>;
+
+    fn release_scoped<'a>(
+        &'a self,
+        client_api_key_id: &'a ClientApiKeyId,
+        _user_id: Option<&'a UserId>,
+        model_request_id: &'a ModelRequestId,
+    ) -> BoxFuture<'a, Result<bool, ClientAdmissionError>> {
+        self.release(client_api_key_id, model_request_id)
+    }
 
     fn restore(
         &self,

@@ -20,7 +20,8 @@ use gateway_admin::{
             ClientKeyListQuery as AdminClientKeyListQuery, ClientKeyPage as AdminClientKeyPage,
             ClientKeyRecord as AdminClientKeyRecord, ClientKeySecret as AdminClientKeySecret,
             ClientKeySort as AdminClientKeySort, ClientKeySortField as AdminClientKeySortField,
-            DeleteClientKey, NewClientKey, ResetClientKeyBudget, SetClientKeyEnabled,
+            ClientKeyUsageBudgetContext as AdminClientKeyUsageBudgetContext, DeleteClientKey,
+            NewClientKey, ReplaceClientKeyIdentity, ResetClientKeyBudget, SetClientKeyEnabled,
             SortDirection as AdminSortDirection, UpdateClientKey as AdminUpdateClientKey,
         },
     },
@@ -44,7 +45,9 @@ use crate::{
     postgres_unavailable, require_nonempty,
 };
 
-use super::{ControlPlaneRepository, PgControlPlaneRepository};
+use super::{
+    ControlPlaneRepository, PgControlPlaneRepository, append_admin_audit_event_in_transaction,
+};
 
 const ENTITY: &str = "client API key";
 const CLIENT_API_KEY_LAST_USED_FLUSH_DELAY: Duration = Duration::from_secs(1);
@@ -273,6 +276,7 @@ pub struct ClientApiKeyPage {
 
 #[derive(Clone)]
 pub struct NewClientApiKey {
+    pub owner_user_id: Option<String>,
     pub openai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
     pub xai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
     pub id: String,
@@ -300,6 +304,9 @@ impl NewClientApiKey {
     pub fn validate(&self) -> StoreResult<()> {
         require_nonempty(ENTITY, "id", &self.id)?;
         require_nonempty(ENTITY, "name", &self.name)?;
+        if self.owner_user_id.as_deref().is_some_and(str::is_empty) {
+            return Err(invalid("owner user id must not be empty"));
+        }
         validate_group_ids(&self.group_ids)?;
         validate_key(&self.key)
     }
@@ -307,6 +314,7 @@ impl NewClientApiKey {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateClientApiKeyDetails {
+    pub owner_user_id: Option<String>,
     pub openai_client_profile_override: Option<Option<gateway_core::account::OpaqueProviderData>>,
     pub xai_client_profile_override: Option<Option<gateway_core::account::OpaqueProviderData>>,
     pub id: String,
@@ -323,6 +331,9 @@ impl UpdateClientApiKeyDetails {
     pub fn validate(&self) -> StoreResult<()> {
         require_nonempty(ENTITY, "id", &self.id)?;
         require_nonempty(ENTITY, "name", &self.name)?;
+        if self.owner_user_id.as_deref().is_some_and(str::is_empty) {
+            return Err(invalid("owner user id must not be empty"));
+        }
         validate_group_ids(&self.group_ids)?;
         to_i64(self.max_concurrency)?;
         to_i64(self.requests_per_minute)?;
@@ -362,8 +373,34 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
         &self,
         query: ClientApiKeyListQuery,
     ) -> StoreResult<ClientApiKeyPage> {
+        self.list_client_api_keys_scoped(query, None).await
+    }
+
+    async fn reveal_client_api_key(&self, id: &str) -> StoreResult<Option<ClientApiKeySecret>> {
+        self.reveal_client_api_key_scoped(id, None).await
+    }
+
+    async fn get_client_api_key(&self, id: &str) -> StoreResult<Option<ClientApiKeyRecord>> {
+        self.get_client_api_key_scoped(id, None).await
+    }
+
+    async fn touch_client_api_keys(
+        &self,
+        touched_at: &BTreeMap<String, DateTime<Utc>>,
+    ) -> StoreResult<u64> {
+        self.touch_client_api_keys_inner(touched_at).await
+    }
+}
+
+impl PgClientApiKeyRepository {
+    async fn list_client_api_keys_scoped(
+        &self,
+        query: ClientApiKeyListQuery,
+        owner_user_id: Option<&str>,
+    ) -> StoreResult<ClientApiKeyPage> {
         query.validate()?;
-        let total = count_client_api_keys(&self.pool, query.search.as_deref()).await?;
+        let total =
+            count_client_api_keys(&self.pool, query.search.as_deref(), owner_user_id).await?;
         let mut statement = QueryBuilder::<Postgres>::new(
             "select k.id, k.name, k.label, k.provider_request_profiles_json -> 'openai' as openai_client_profile_override,
                     k.provider_request_profiles_json -> 'xai' as xai_client_profile_override,
@@ -373,6 +410,12 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
              from client_api_keys k
              where true",
         );
+        if let Some(owner_user_id) = owner_user_id {
+            statement.push(" and k.owner_user_id = ");
+            statement.push_bind(owner_user_id);
+        } else {
+            statement.push(" and k.owner_user_id is null");
+        }
         push_client_key_search(&mut statement, query.search.as_deref());
         if let Some(cursor) = &query.cursor {
             push_client_key_cursor(&mut statement, cursor);
@@ -409,13 +452,19 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
         })
     }
 
-    async fn reveal_client_api_key(&self, id: &str) -> StoreResult<Option<ClientApiKeySecret>> {
+    async fn reveal_client_api_key_scoped(
+        &self,
+        id: &str,
+        owner_user_id: Option<&str>,
+    ) -> StoreResult<Option<ClientApiKeySecret>> {
         require_nonempty(ENTITY, "id", id)?;
         sqlx::query_as::<_, (String, String, bool, i64, i64)>(
             "select id, key, enabled, max_concurrency, requests_per_minute
-             from client_api_keys where id = $1",
+             from client_api_keys where id = $1
+             and (owner_user_id = $2 or ($2::text is null and owner_user_id is null))",
         )
         .bind(id)
+        .bind(owner_user_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|_| postgres_unavailable("reveal client API key"))?
@@ -423,44 +472,24 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
         .transpose()
     }
 
-    async fn get_client_api_key(&self, id: &str) -> StoreResult<Option<ClientApiKeyRecord>> {
+    async fn get_client_api_key_scoped(
+        &self,
+        id: &str,
+        owner_user_id: Option<&str>,
+    ) -> StoreResult<Option<ClientApiKeyRecord>> {
         require_nonempty(ENTITY, "id", id)?;
         let record = sqlx::query(
             "select k.id, k.name, k.label, k.provider_request_profiles_json -> 'openai' as openai_client_profile_override,
                     k.provider_request_profiles_json -> 'xai' as xai_client_profile_override,
                     left(k.key, least(10, length(k.key) / 2)) as prefix, k.enabled,
                     k.max_concurrency, k.requests_per_minute, k.last_used_at, k.created_at,
-                    k.updated_at, coalesce(groups.groups, '[]'::jsonb) as groups,
-                    case
-                      when groups.binding_count = 0 then coalesce(
-                        (select array_agg(distinct a.provider_kind order by a.provider_kind)
-                         from provider_accounts a),
-                        '{}'
-                      )
-                      else coalesce(groups.provider_kinds, '{}')
-                    end as provider_kinds
+                    k.updated_at, '[]'::jsonb as groups, '{}'::text[] as provider_kinds
              from client_api_keys k
-             left join lateral (
-               select
-                 (select count(*)::bigint
-                  from client_api_key_groups kg
-                  where kg.client_api_key_id = k.id) as binding_count,
-                 (select jsonb_agg(jsonb_build_object(
-                           'id', g.id, 'name', g.name, 'color', g.color, 'enabled', g.enabled
-                         ) order by g.id)
-                  from client_api_key_groups kg
-                  join account_groups g on g.id = kg.account_group_id
-                  where kg.client_api_key_id = k.id) as groups,
-                 (select array_agg(distinct a.provider_kind order by a.provider_kind)
-                  from client_api_key_groups kg
-                  join account_groups g on g.id = kg.account_group_id and g.enabled
-                  join account_group_accounts gm on gm.account_group_id = g.id
-                  join provider_accounts a on a.id = gm.provider_account_id
-                  where kg.client_api_key_id = k.id) as provider_kinds
-             ) groups on true
-             where k.id = $1",
+             where k.id = $1
+             and (k.owner_user_id = $2 or ($2::text is null and k.owner_user_id is null))",
         )
         .bind(id)
+        .bind(owner_user_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|_| postgres_unavailable("get client API key"))?
@@ -470,6 +499,7 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
         let Some(mut record) = record else {
             return Ok(None);
         };
+        load_client_key_memberships(&self.pool, std::slice::from_mut(&mut record)).await?;
         super::client_budgets::load_client_key_budgets(
             &self.pool,
             std::slice::from_mut(&mut record),
@@ -478,7 +508,7 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
         Ok(Some(record))
     }
 
-    async fn touch_client_api_keys(
+    async fn touch_client_api_keys_inner(
         &self,
         touched_at: &BTreeMap<String, DateTime<Utc>>,
     ) -> StoreResult<u64> {
@@ -708,7 +738,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
         command: ResetClientKeyBudget,
         context: &MutationContext,
     ) -> AdminStoreResult<()> {
-        super::client_budgets::reset_client_key_budget(&self.keys.pool, command, context)
+        super::client_budgets::reset_client_key_budget(&self.keys.pool, command, context, None)
             .await
             .map_err(|error| admin_store_error(ENTITY, error))
     }
@@ -723,6 +753,75 @@ impl ClientKeyStore for PgAdminClientKeyStore {
             .map_err(|error| admin_store_error(ENTITY, error))?
             .map(admin_client_key_record)
             .transpose()
+    }
+
+    async fn usage_budget_context(
+        &self,
+        id: &ClientApiKeyId,
+    ) -> AdminStoreResult<Option<AdminClientKeyUsageBudgetContext>> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                Option<String>,
+                bool,
+                String,
+                String,
+                String,
+                String,
+                Option<DateTime<Utc>>,
+                Option<DateTime<Utc>>,
+            ),
+        >(
+            "select k.owner_user_id,
+                    k.enabled and (k.owner_user_id is null or coalesce(u.enabled, false)),
+                    k.daily_limit_usd::text, k.weekly_limit_usd::text,
+                    (case when w.daily_end > now() then w.daily_used_usd else 0 end)::text,
+                    (case when w.weekly_end > now() then w.weekly_used_usd else 0 end)::text,
+                    case when w.daily_end > now() then w.daily_end end,
+                    case when w.weekly_end > now() then w.weekly_end end
+             from client_api_keys k
+             left join users u on u.id = k.owner_user_id
+             left join client_key_budget_windows w on w.client_api_key_id = k.id
+             where k.id = $1",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&self.keys.pool)
+        .await
+        .map_err(|_| {
+            admin_store_error(ENTITY, postgres_unavailable("load client key usage budget"))
+        })?;
+        let Some((
+            owner_user_id,
+            enabled,
+            daily_limit,
+            weekly_limit,
+            daily_used,
+            weekly_used,
+            daily_resets_at,
+            weekly_resets_at,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let parse = |value: String| {
+            value
+                .parse::<Decimal>()
+                .map_err(|_| admin_store_error(ENTITY, invalid("invalid client key budget")))
+        };
+        Ok(Some(AdminClientKeyUsageBudgetContext {
+            owner_user_id,
+            enabled,
+            budget: ClientBudgetStatus {
+                limits: ClientBudgetLimits {
+                    daily_usd: parse(daily_limit)?,
+                    weekly_usd: parse(weekly_limit)?,
+                },
+                daily_used_usd: parse(daily_used)?,
+                weekly_used_usd: parse(weekly_used)?,
+                daily_resets_at: daily_resets_at.map(Into::into),
+                weekly_resets_at: weekly_resets_at.map(Into::into),
+            },
+        }))
     }
 
     async fn list_client_keys(
@@ -773,6 +872,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
             .control_plane
             .create_client_api_key(
                 NewClientApiKey {
+                    owner_user_id: None,
                     openai_client_profile_override: command.openai_client_profile_override,
                     xai_client_profile_override: command.xai_client_profile_override,
                     id: id.as_str().to_owned(),
@@ -825,6 +925,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
             .control_plane
             .update_client_api_key(
                 UpdateClientApiKeyDetails {
+                    owner_user_id: None,
                     openai_client_profile_override: command.openai_client_profile_override,
                     xai_client_profile_override: command.xai_client_profile_override,
                     id: id.as_str().to_owned(),
@@ -909,6 +1010,332 @@ impl ClientKeyStore for PgAdminClientKeyStore {
             .map_err(|error| admin_store_error(ENTITY, error))
             .and_then(admin_revision)
     }
+
+    async fn reset_user_client_key_budget(
+        &self,
+        user_id: &str,
+        command: ResetClientKeyBudget,
+    ) -> AdminStoreResult<()> {
+        let context = MutationContext {
+            // reset 实现用锁定的owner生成明确的 user_session 审计主体。
+            actor: gateway_admin::model::MutationActor::System,
+            request_id: format!("key_reset_{}", uuid::Uuid::now_v7().simple()),
+        };
+        super::client_budgets::reset_client_key_budget(
+            &self.keys.pool,
+            command,
+            &context,
+            Some(user_id),
+        )
+        .await
+        .map_err(|error| admin_store_error(ENTITY, error))
+    }
+
+    async fn list_user_client_keys(
+        &self,
+        user_id: &str,
+        query: AdminClientKeyListQuery,
+    ) -> AdminStoreResult<AdminClientKeyPage> {
+        require_nonempty(ENTITY, "owner user ID", user_id)
+            .map_err(|error| admin_store_error(ENTITY, error))?;
+        let config_revision = self.revision().await?;
+        let page = self
+            .keys
+            .list_client_api_keys_scoped(store_client_key_query(query)?, Some(user_id))
+            .await
+            .map_err(|error| admin_store_error(ENTITY, error))?;
+        Ok(AdminClientKeyPage {
+            config_revision,
+            items: page
+                .items
+                .into_iter()
+                .map(admin_client_key_record)
+                .collect::<AdminStoreResult<Vec<_>>>()?,
+            total: page.total,
+            next_cursor: page.next_cursor.map(admin_client_key_cursor).transpose()?,
+        })
+    }
+
+    async fn reveal_user_client_key(
+        &self,
+        user_id: &str,
+        id: &ClientApiKeyId,
+    ) -> AdminStoreResult<Option<AdminClientKeySecret>> {
+        require_nonempty(ENTITY, "owner user ID", user_id)
+            .map_err(|error| admin_store_error(ENTITY, error))?;
+        let Some(secret) = self
+            .keys
+            .reveal_client_api_key_scoped(id.as_str(), Some(user_id))
+            .await
+            .map_err(|error| admin_store_error(ENTITY, error))?
+        else {
+            return Ok(None);
+        };
+        let record = self.required_user_record(user_id, id).await?;
+        Ok(Some(AdminClientKeySecret::new(record, secret.key)))
+    }
+
+    async fn create_user_client_key(
+        &self,
+        user_id: &str,
+        command: NewClientKey,
+    ) -> AdminStoreResult<(gateway_admin::model::Revision, AdminClientKeyRecord)> {
+        if !command.group_ids.is_empty()
+            || command.openai_client_profile_override.is_some()
+            || command.xai_client_profile_override.is_some()
+        {
+            return Err(admin_store_error(
+                ENTITY,
+                invalid("owned key cannot set upstream groups or client profiles"),
+            ));
+        }
+        let id = command.id;
+        let (mut transaction, revision) = self.begin_user_mutation(user_id).await?;
+        insert_client_api_key_in_transaction(
+            &mut transaction,
+            &NewClientApiKey {
+                owner_user_id: Some(user_id.to_owned()),
+                openai_client_profile_override: None,
+                xai_client_profile_override: None,
+                id: id.as_str().to_owned(),
+                name: command.name,
+                label: command.label,
+                group_ids: Vec::new(),
+                key: command.plaintext,
+                max_concurrency: command.limits.max_concurrency,
+                requests_per_minute: command.limits.requests_per_minute,
+                budget: command.budget,
+            },
+        )
+        .await
+        .map_err(|error| admin_store_error(ENTITY, error))?;
+        transaction.commit().await.map_err(|_| {
+            admin_store_error(ENTITY, postgres_unavailable("commit owned key creation"))
+        })?;
+        Ok((
+            admin_revision(revision)?,
+            self.required_user_record(user_id, &id).await?,
+        ))
+    }
+
+    async fn replace_user_client_key_identity(
+        &self,
+        user_id: &str,
+        command: ReplaceClientKeyIdentity,
+        context: &MutationContext,
+    ) -> AdminStoreResult<(gateway_admin::model::Revision, AdminClientKeyRecord)> {
+        let id = command.id;
+        let (mut transaction, revision) = self.begin_user_mutation(user_id).await?;
+        lock_owned_key(&mut transaction, user_id, id.as_str()).await?;
+        let mut profiles = serde_json::Map::new();
+        for (name, profile) in [
+            ("openai", command.openai_client_profile_override),
+            ("xai", command.xai_client_profile_override),
+        ] {
+            if let Some(profile) = profile {
+                let value = profile.into_inner();
+                if !value.is_empty() {
+                    profiles.insert(name.to_owned(), serde_json::Value::Object(value));
+                }
+            }
+        }
+        let result = sqlx::query(
+            "update client_api_keys
+             set provider_request_profiles_json=$3, updated_at=now()
+             where id=$1 and owner_user_id=$2",
+        )
+        .bind(id.as_str())
+        .bind(user_id)
+        .bind(sqlx::types::Json(profiles))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| {
+            admin_store_error(ENTITY, postgres_unavailable("update owned key identity"))
+        })?;
+        if result.rows_affected() != 1 {
+            return Err(missing_owned_key(id.as_str()));
+        }
+        append_admin_audit_event_in_transaction(
+            &mut transaction,
+            mutation_audit(
+                context,
+                "update",
+                "client_api_key",
+                id.as_str(),
+                vec!["provider_request_profiles_json".to_owned()],
+            ),
+            revision,
+        )
+        .await
+        .map_err(|error| admin_store_error(ENTITY, error))?;
+        transaction.commit().await.map_err(|_| {
+            admin_store_error(ENTITY, postgres_unavailable("commit owned key identity"))
+        })?;
+        Ok((
+            admin_revision(revision)?,
+            self.required_user_record(user_id, &id).await?,
+        ))
+    }
+
+    async fn update_user_client_key(
+        &self,
+        user_id: &str,
+        command: AdminUpdateClientKey,
+    ) -> AdminStoreResult<(gateway_admin::model::Revision, AdminClientKeyRecord)> {
+        if !command.group_ids.is_empty()
+            || command.openai_client_profile_override.is_some()
+            || command.xai_client_profile_override.is_some()
+        {
+            return Err(admin_store_error(
+                ENTITY,
+                invalid("owned key cannot set upstream groups or client profiles"),
+            ));
+        }
+        let id = command.id;
+        let (mut transaction, revision) = self.begin_user_mutation(user_id).await?;
+        lock_owned_key(&mut transaction, user_id, id.as_str()).await?;
+        update_client_api_key_in_transaction(
+            &mut transaction,
+            &UpdateClientApiKeyDetails {
+                owner_user_id: Some(user_id.to_owned()),
+                // 普通用户只能改 Key 自身字段；管理员设置的身份覆盖保持不变。
+                openai_client_profile_override: None,
+                xai_client_profile_override: None,
+                id: id.as_str().to_owned(),
+                name: command.name,
+                label: command.label,
+                group_ids: Vec::new(),
+                max_concurrency: command.limits.max_concurrency,
+                requests_per_minute: command.limits.requests_per_minute,
+                daily_limit_usd: command.daily_limit_usd,
+                weekly_limit_usd: command.weekly_limit_usd,
+            },
+        )
+        .await
+        .map_err(|error| admin_store_error(ENTITY, error))?;
+        transaction.commit().await.map_err(|_| {
+            admin_store_error(ENTITY, postgres_unavailable("commit owned key update"))
+        })?;
+        Ok((
+            admin_revision(revision)?,
+            self.required_user_record(user_id, &id).await?,
+        ))
+    }
+
+    async fn set_user_client_key_enabled(
+        &self,
+        user_id: &str,
+        command: SetClientKeyEnabled,
+    ) -> AdminStoreResult<(gateway_admin::model::Revision, AdminClientKeyRecord)> {
+        let id = command.id;
+        let (mut transaction, revision) = self.begin_user_mutation(user_id).await?;
+        set_client_api_key_enabled_in_transaction_for_owner(
+            &mut transaction,
+            id.as_str(),
+            command.enabled,
+            Some(user_id),
+        )
+        .await
+        .map_err(|error| admin_store_error(ENTITY, error))?;
+        transaction.commit().await.map_err(|_| {
+            admin_store_error(ENTITY, postgres_unavailable("commit owned key status"))
+        })?;
+        Ok((
+            admin_revision(revision)?,
+            self.required_user_record(user_id, &id).await?,
+        ))
+    }
+
+    async fn delete_user_client_key(
+        &self,
+        user_id: &str,
+        command: DeleteClientKey,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        let (mut transaction, revision) = self.begin_user_mutation(user_id).await?;
+        delete_client_api_key_in_transaction_for_owner(
+            &mut transaction,
+            command.id.as_str(),
+            Some(user_id),
+        )
+        .await
+        .map_err(|error| admin_store_error(ENTITY, error))?;
+        transaction.commit().await.map_err(|_| {
+            admin_store_error(ENTITY, postgres_unavailable("commit owned key deletion"))
+        })?;
+        admin_revision(revision)
+    }
+}
+
+impl PgAdminClientKeyStore {
+    async fn required_user_record(
+        &self,
+        user_id: &str,
+        id: &ClientApiKeyId,
+    ) -> AdminStoreResult<AdminClientKeyRecord> {
+        self.keys
+            .get_client_api_key_scoped(id.as_str(), Some(user_id))
+            .await
+            .map_err(|error| admin_store_error(ENTITY, error))?
+            .ok_or_else(|| missing_owned_key(id.as_str()))
+            .and_then(admin_client_key_record)
+    }
+
+    async fn begin_user_mutation(
+        &self,
+        user_id: &str,
+    ) -> AdminStoreResult<(Transaction<'static, Postgres>, crate::Revision)> {
+        require_nonempty(ENTITY, "owner user ID", user_id)
+            .map_err(|error| admin_store_error(ENTITY, error))?;
+        let mut transaction = self.keys.pool.begin().await.map_err(|_| {
+            admin_store_error(ENTITY, postgres_unavailable("begin owned key mutation"))
+        })?;
+        // 与用户/订阅控制面一致：先锁配置版本，再锁账户，失败时统一回滚。
+        let revision = super::bump_config_revision_in_transaction(&mut transaction)
+            .await
+            .map_err(|error| admin_store_error(ENTITY, error))?;
+        let enabled =
+            sqlx::query_scalar::<_, bool>("select enabled from users where id = $1 for share")
+                .bind(user_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|_| admin_store_error(ENTITY, postgres_unavailable("lock key owner")))?;
+        if enabled != Some(true) {
+            return Err(admin_store_error(
+                ENTITY,
+                invalid("key owner is unavailable"),
+            ));
+        }
+        Ok((transaction, revision))
+    }
+}
+
+fn missing_owned_key(id: &str) -> gateway_admin::ports::store::AdminStoreError {
+    admin_store_error(
+        ENTITY,
+        StoreError::NotFound {
+            entity: ENTITY,
+            id: id.to_owned(),
+        },
+    )
+}
+
+async fn lock_owned_key(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_id: &str,
+    id: &str,
+) -> AdminStoreResult<()> {
+    let exists = sqlx::query_scalar::<_, String>(
+        "select id from client_api_keys where id = $1 and owner_user_id = $2 for update",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| admin_store_error(ENTITY, postgres_unavailable("lock owned client key")))?;
+    if exists.is_none() {
+        return Err(missing_owned_key(id));
+    }
+    Ok(())
 }
 
 fn store_client_key_query(
@@ -1035,12 +1462,13 @@ pub(crate) async fn insert_client_api_key_in_transaction(
     ensure_client_key_name_available(transaction, &key.id, key.name.trim()).await?;
     sqlx::query(
         "insert into client_api_keys (
-           id, name, label, key, enabled, max_concurrency, requests_per_minute,
+           id, owner_user_id, name, label, key, enabled, max_concurrency, requests_per_minute,
            last_used_at, created_at, updated_at, daily_limit_usd, weekly_limit_usd, provider_request_profiles_json
-         ) values ($1, $2, $3, $4, true, $5, $6, null, now(), now(), $7::text::numeric, $8::text::numeric, case when $9::jsonb is null then '{}'::jsonb else jsonb_build_object('openai', $9::jsonb) end
-             || case when $10::jsonb is null then '{}'::jsonb else jsonb_build_object('xai', $10::jsonb) end)",
+         ) values ($1, $2, $3, $4, $5, true, $6, $7, null, now(), now(), $8::text::numeric, $9::text::numeric, case when $10::jsonb is null then '{}'::jsonb else jsonb_build_object('openai', $10::jsonb) end
+             || case when $11::jsonb is null then '{}'::jsonb else jsonb_build_object('xai', $11::jsonb) end)",
     )
     .bind(&key.id)
+    .bind(&key.owner_user_id)
     .bind(key.name.trim())
     .bind(&key.label)
     .bind(&key.key)
@@ -1082,12 +1510,13 @@ pub(crate) async fn update_client_api_key_in_transaction(
              requests_per_minute = $5, updated_at = now(),
              daily_limit_usd = coalesce($6::text::numeric, daily_limit_usd),
              weekly_limit_usd = coalesce($7::text::numeric, weekly_limit_usd),
-             provider_request_profiles_json = (provider_request_profiles_json
+             provider_request_profiles_json =
+               (provider_request_profiles_json
                  - case when $8 then array['openai'] else array[]::text[] end
                  - case when $10 then array['xai'] else array[]::text[] end)
                  || case when $9::jsonb is null then '{}'::jsonb else jsonb_build_object('openai', $9::jsonb) end
                  || case when $11::jsonb is null then '{}'::jsonb else jsonb_build_object('xai', $11::jsonb) end
-         where id = $1",
+         where id = $1 and (owner_user_id = $12 or ($12::text is null and owner_user_id is null))",
     )
     .bind(&key.id)
     .bind(key.name.trim())
@@ -1110,6 +1539,7 @@ pub(crate) async fn update_client_api_key_in_transaction(
             .and_then(Option::as_ref)
             .map(|profile| sqlx::types::Json(profile.expose_to_provider())),
     )
+    .bind(&key.owner_user_id)
     .execute(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("update client API key in transaction"))?;
@@ -1143,32 +1573,38 @@ async fn ensure_client_key_name_available(
     Ok(())
 }
 
-pub(crate) async fn set_client_api_key_enabled_in_transaction(
+pub(crate) async fn set_client_api_key_enabled_in_transaction_for_owner(
     transaction: &mut Transaction<'_, Postgres>,
     id: &str,
     enabled: bool,
+    owner_user_id: Option<&str>,
 ) -> StoreResult<()> {
     require_nonempty(ENTITY, "id", id)?;
     let result =
-        sqlx::query("update client_api_keys set enabled = $2, updated_at = now() where id = $1")
+        sqlx::query("update client_api_keys set enabled = $2, updated_at = now() where id = $1 and (owner_user_id = $3 or ($3::text is null and owner_user_id is null))")
             .bind(id)
             .bind(enabled)
+            .bind(owner_user_id)
             .execute(&mut **transaction)
             .await
             .map_err(|_| postgres_unavailable("set client API key state in transaction"))?;
     require_changed(result.rows_affected(), id)
 }
 
-pub(crate) async fn delete_client_api_key_in_transaction(
+pub(crate) async fn delete_client_api_key_in_transaction_for_owner(
     transaction: &mut Transaction<'_, Postgres>,
     id: &str,
+    owner_user_id: Option<&str>,
 ) -> StoreResult<()> {
     require_nonempty(ENTITY, "id", id)?;
-    let result = sqlx::query("delete from client_api_keys where id = $1")
-        .bind(id)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|_| postgres_unavailable("delete client API key in transaction"))?;
+    let result = sqlx::query(
+        "delete from client_api_keys where id = $1 and (owner_user_id = $2 or ($2::text is null and owner_user_id is null))",
+    )
+    .bind(id)
+    .bind(owner_user_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| postgres_unavailable("delete client API key in transaction"))?;
     require_changed(result.rows_affected(), id)
 }
 
@@ -1305,9 +1741,19 @@ fn client_record_from_row(row: &sqlx::postgres::PgRow) -> StoreResult<ClientApiK
     })
 }
 
-async fn count_client_api_keys(pool: &PgPool, search: Option<&str>) -> StoreResult<u64> {
+async fn count_client_api_keys(
+    pool: &PgPool,
+    search: Option<&str>,
+    owner_user_id: Option<&str>,
+) -> StoreResult<u64> {
     let mut statement =
         QueryBuilder::<Postgres>::new("select count(*)::bigint from client_api_keys where true");
+    if let Some(owner_user_id) = owner_user_id {
+        statement.push(" and owner_user_id = ");
+        statement.push_bind(owner_user_id);
+    } else {
+        statement.push(" and owner_user_id is null");
+    }
     push_client_key_search(&mut statement, search);
     let count = statement
         .build_query_scalar::<i64>()
@@ -1342,8 +1788,8 @@ async fn load_client_key_memberships(
         .map(|record| record.id.clone())
         .collect::<Vec<_>>();
     let rows = sqlx::query(
-        "with requested_keys(key_id) as (
-           select unnest($1::text[])
+        "with requested_keys as (
+           select id as key_id, owner_user_id from client_api_keys where id = any($1::text[])
          ),
          global_providers as (
            select coalesce(array_agg(distinct provider_kind order by provider_kind), '{}')
@@ -1353,20 +1799,26 @@ async fn load_client_key_memberships(
          select requested_keys.key_id,
                 groups.id as group_id, groups.name as group_name, groups.color as group_color,
                 groups.enabled as group_enabled,
-                global_providers.provider_kinds as global_provider_kinds,
+                case when requested_keys.owner_user_id is null
+                  then global_providers.provider_kinds else '{}'::text[] end as global_provider_kinds,
                 coalesce(array_agg(distinct accounts.provider_kind order by accounts.provider_kind)
                   filter (where accounts.provider_kind is not null), '{}')
                   as group_provider_kinds
            from requested_keys
            cross join global_providers
-           left join client_api_key_groups bindings
-             on bindings.client_api_key_id = requested_keys.key_id
+           left join lateral (
+             select account_group_id from client_api_key_groups
+              where client_api_key_id = requested_keys.key_id and requested_keys.owner_user_id is null
+             union all
+             select account_group_id from user_account_groups
+              where user_id = requested_keys.owner_user_id
+           ) bindings on true
            left join account_groups groups on groups.id = bindings.account_group_id
            left join account_group_accounts memberships
              on memberships.account_group_id = groups.id and groups.enabled
            left join provider_accounts accounts
              on accounts.id = memberships.provider_account_id
-          group by requested_keys.key_id, global_providers.provider_kinds,
+          group by requested_keys.key_id, requested_keys.owner_user_id, global_providers.provider_kinds,
                    groups.id, groups.name, groups.color, groups.enabled
           order by requested_keys.key_id, groups.id",
     )

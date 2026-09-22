@@ -11,8 +11,8 @@ use crate::account::{AccountSelectionPolicy, ProviderAccountId, RotationStrategy
 use crate::concurrency::ConcurrencyQueuePolicy;
 use crate::operation::Operation;
 use crate::policy::{
-    ClientApiKeyId, ClientPolicy, CodexClientMinVersions, CodexClientVersion,
-    PlaintextClientApiKey, RateLimits,
+    ClientApiKeyId, ClientBillingPolicy, ClientPolicy, CodexClientMinVersions, CodexClientVersion,
+    PlaintextClientApiKey, RateLimits, UserId, UserRateLimits,
 };
 use crate::validation::RoutingError;
 
@@ -126,9 +126,20 @@ pub struct SnapshotClientPolicyFacts {
     plaintext_key: PlaintextClientApiKey,
     group_ids: Vec<AccountGroupId>,
     limits: RateLimits,
+    user_id: Option<UserId>,
+    user_rate_limits: UserRateLimits,
+    billing_policy: Option<ClientBillingPolicy>,
+    user_group_scope: bool,
+    username_snapshot: Option<String>,
+    client_api_key_name_snapshot: Option<String>,
 }
 
 impl SnapshotClientPolicyFacts {
+    #[must_use]
+    pub const fn key_id(&self) -> &ClientApiKeyId {
+        &self.key_id
+    }
+
     #[must_use]
     pub fn with_request_profiles(
         mut self,
@@ -151,7 +162,39 @@ impl SnapshotClientPolicyFacts {
             plaintext_key,
             group_ids,
             limits,
+            user_id: None,
+            user_rate_limits: UserRateLimits::unlimited(),
+            billing_policy: None,
+            user_group_scope: false,
+            username_snapshot: None,
+            client_api_key_name_snapshot: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_user_runtime(
+        mut self,
+        user_id: UserId,
+        user_rate_limits: UserRateLimits,
+        billing_policy: Option<ClientBillingPolicy>,
+        user_group_scope: bool,
+    ) -> Self {
+        self.user_id = Some(user_id);
+        self.user_rate_limits = user_rate_limits;
+        self.billing_policy = billing_policy;
+        self.user_group_scope = user_group_scope;
+        self
+    }
+
+    #[must_use]
+    pub fn with_historical_names(
+        mut self,
+        username_snapshot: Option<String>,
+        client_api_key_name_snapshot: Option<String>,
+    ) -> Self {
+        self.username_snapshot = username_snapshot;
+        self.client_api_key_name_snapshot = client_api_key_name_snapshot;
+        self
     }
 }
 
@@ -268,6 +311,10 @@ impl SnapshotFacts {
     #[must_use]
     pub const fn observed_current_revision(&self) -> ConfigRevision {
         self.observed_current_revision
+    }
+
+    pub fn client_policies(&self) -> impl Iterator<Item = &SnapshotClientPolicyFacts> {
+        self.client_policies.iter()
     }
 }
 
@@ -485,10 +532,15 @@ async fn compile_runtime_snapshot(
     let mut client_policies = Vec::with_capacity(facts.client_policies.len());
     for policy in facts.client_policies {
         let mut disable_fast = false;
-        let account_scope = if policy.group_ids.is_empty() {
+        let account_scope = if policy.group_ids.is_empty() && !policy.user_group_scope {
             FrozenAccountScope::new(
                 Arc::clone(&account_directory),
                 ClientRoutingScope::all_accounts(),
+            )
+        } else if policy.group_ids.is_empty() {
+            FrozenAccountScope::new(
+                Arc::clone(&account_directory),
+                ClientRoutingScope::restricted_empty(),
             )
         } else {
             let mut seen = BTreeSet::new();
@@ -521,7 +573,7 @@ async fn compile_runtime_snapshot(
         };
         let mut request_profiles = facts.settings.request_profiles.clone();
         request_profiles.extend(policy.request_profiles);
-        client_policies.push(ClientPolicy::new(
+        let client_policy = ClientPolicy::new(
             policy.key_id,
             policy.plaintext_key,
             Arc::new(
@@ -531,7 +583,17 @@ async fn compile_runtime_snapshot(
             ),
             true,
             policy.limits,
-        ));
+        );
+        let client_policy = client_policy.with_historical_names(
+            policy.username_snapshot,
+            policy.client_api_key_name_snapshot,
+        );
+        client_policies.push(match (policy.user_id, policy.billing_policy) {
+            (Some(user_id), billing_policy) => {
+                client_policy.with_user_runtime(user_id, policy.user_rate_limits, billing_policy)
+            }
+            (None, _) => client_policy,
+        });
     }
 
     // 关闭自定义时保留持久化值，但不生成全局覆盖；请求继续使用客户端字段。

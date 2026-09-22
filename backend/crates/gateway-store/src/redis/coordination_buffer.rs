@@ -16,7 +16,7 @@ use gateway_core::engine::execution::{
     ProviderCircuitDecision, ProviderCircuitError, ProviderCircuitPort,
 };
 use gateway_core::lifecycle::CancellationToken;
-use gateway_core::policy::ClientApiKeyId;
+use gateway_core::policy::{ClientApiKeyId, UserId};
 use gateway_core::routing::ProviderKind;
 use gateway_core::task::{DaemonTask, WorkerTaskError};
 use tokio::sync::{Mutex, mpsc};
@@ -80,6 +80,20 @@ impl ClientAdmissionPort for BufferedClientAdmissionPort {
     fn abandon(&self, key: &ClientApiKeyId, request: &ModelRequestId) {
         self.enqueue(AdmissionRelease {
             client_api_key_id: key.clone(),
+            user_id: None,
+            model_request_id: request.clone(),
+        });
+    }
+
+    fn abandon_scoped(
+        &self,
+        key: &ClientApiKeyId,
+        user_id: Option<&UserId>,
+        request: &ModelRequestId,
+    ) {
+        self.enqueue(AdmissionRelease {
+            client_api_key_id: key.clone(),
+            user_id: user_id.cloned(),
             model_request_id: request.clone(),
         });
     }
@@ -98,6 +112,21 @@ impl ClientAdmissionPort for BufferedClientAdmissionPort {
     ) -> BoxFuture<'a, Result<bool, ClientAdmissionError>> {
         let enqueued = self.enqueue(AdmissionRelease {
             client_api_key_id: client_api_key_id.clone(),
+            user_id: None,
+            model_request_id: model_request_id.clone(),
+        });
+        Box::pin(ready(Ok(enqueued)))
+    }
+
+    fn release_scoped<'a>(
+        &'a self,
+        client_api_key_id: &'a ClientApiKeyId,
+        user_id: Option<&'a UserId>,
+        model_request_id: &'a ModelRequestId,
+    ) -> BoxFuture<'a, Result<bool, ClientAdmissionError>> {
+        let enqueued = self.enqueue(AdmissionRelease {
+            client_api_key_id: client_api_key_id.clone(),
+            user_id: user_id.cloned(),
             model_request_id: model_request_id.clone(),
         });
         Box::pin(ready(Ok(enqueued)))
@@ -113,6 +142,7 @@ impl ClientAdmissionPort for BufferedClientAdmissionPort {
 
 struct AdmissionRelease {
     client_api_key_id: ClientApiKeyId,
+    user_id: Option<UserId>,
     model_request_id: ModelRequestId,
 }
 
@@ -137,7 +167,11 @@ impl DaemonTask for ClientAdmissionReleaseWriter {
                 };
                 if let Err(error) = self
                     .inner
-                    .release(&release.client_api_key_id, &release.model_request_id)
+                    .release_scoped(
+                        &release.client_api_key_id,
+                        release.user_id.as_ref(),
+                        &release.model_request_id,
+                    )
                     .await
                 {
                     tracing::warn!(%error, "Client admission 后台释放失败，依赖租约 TTL 收敛");

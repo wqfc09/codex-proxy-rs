@@ -10,6 +10,7 @@ pub(crate) fn store_range(
 
 pub(crate) fn store_usage_filter(filter: admin_observability::UsageFilter) -> UsageRecordFilter {
     UsageRecordFilter {
+        user_id: filter.user_id,
         client_api_key_ref: filter.client_api_key_ref,
         request_id: filter.request_id,
         provider_account_ref: filter.provider_account_ref,
@@ -30,6 +31,33 @@ pub(crate) fn store_request_outcome(outcome: admin_observability::RequestOutcome
     outcome.as_str().to_owned()
 }
 
+pub(crate) fn store_user_usage_filter(
+    user_id: &str,
+    filter: admin_observability::UserUsageFilter,
+) -> UsageRecordFilter {
+    UsageRecordFilter {
+        user_id: Some(user_id.to_owned()),
+        client_api_key_ref: filter.client_api_key_ref,
+        model: filter.model,
+        outcome: filter.outcome.map(store_request_outcome),
+        status_code: filter.status_code,
+        ..UsageRecordFilter::default()
+    }
+}
+
+pub(crate) fn store_user_usage_query(
+    user_id: &str,
+    query: admin_observability::UserUsageQuery,
+) -> AdminStoreResult<UsageRecordQuery> {
+    Ok(UsageRecordQuery {
+        range: store_range(query.range)?,
+        filter: store_user_usage_filter(user_id, query.filter),
+        current_page: query.current_page,
+        page_size: ObservabilityPageSize::new(query.page_size.get())
+            .map_err(observability_error)?,
+    })
+}
+
 pub(crate) fn store_usage_query(
     query: admin_observability::UsageQuery,
 ) -> AdminStoreResult<UsageRecordQuery> {
@@ -46,6 +74,7 @@ pub(crate) fn store_ops_error_filter(
     filter: admin_observability::OpsErrorFilter,
 ) -> OpsErrorFilter {
     OpsErrorFilter {
+        user_id: filter.user_id,
         client_api_key_ref: filter.client_api_key_ref,
         request_id: filter.request_id,
         provider_account_ref: filter.provider_account_ref,
@@ -449,6 +478,8 @@ pub(crate) fn admin_usage_list_record(
     };
     let billing = restore_billing_snapshot(billing, record.billing_snapshot_json.as_ref());
     Ok(admin_observability::UsageListRecord {
+        user_id: record.user_id,
+        username: record.username,
         client_api_key_name: record.client_api_key_name,
         id: record.id,
         endpoint: record.endpoint,
@@ -521,6 +552,8 @@ pub(crate) fn admin_usage_record(
     let billing = restore_billing_snapshot(billing, record.billing_snapshot_json.as_ref());
     Ok(admin_observability::UsageRecord {
         id: record.id,
+        user_id: record.user_id,
+        username: record.username,
         client_api_key_ref: record.client_api_key_ref,
         config_revision: record.config_revision,
         routing_scope: record.routing_scope,
@@ -676,6 +709,161 @@ pub(crate) fn admin_usage_overview(
     })
 }
 
+pub(crate) fn user_usage_record_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> StoreResult<UserUsageRecord> {
+    Ok(UserUsageRecord {
+        id: get(row, "id")?,
+        client_api_key_ref: get(row, "client_api_key_ref")?,
+        client_api_key_name: get(row, "client_api_key_name")?,
+        operation: get(row, "operation")?,
+        request_kind: get(row, "request_kind")?,
+        requested_model_id: get(row, "requested_model_id")?,
+        input_tokens: optional_unsigned(row, "input_tokens")?,
+        output_tokens: optional_unsigned(row, "output_tokens")?,
+        cached_tokens: optional_unsigned(row, "cached_tokens")?,
+        cache_write_tokens: optional_unsigned(row, "cache_write_tokens")?,
+        reasoning_tokens: optional_unsigned(row, "reasoning_tokens")?,
+        image_input_tokens: optional_unsigned(row, "image_input_tokens")?,
+        image_output_tokens: optional_unsigned(row, "image_output_tokens")?,
+        total_tokens: optional_unsigned(row, "total_tokens")?,
+        downstream_rate_multiplier: optional_decimal(row, "downstream_rate_multiplier")?,
+        downstream_billed_amount: optional_decimal(row, "downstream_billed_amount")?,
+        outcome: get(row, "outcome")?,
+        client_status_code: optional_status(row, "client_status_code")?,
+        latency_ms: optional_unsigned(row, "latency_ms")?,
+        started_at: get(row, "started_at")?,
+        completed_at: get(row, "completed_at")?,
+    })
+}
+
+pub(crate) fn user_usage_daily_point_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> StoreResult<UserUsageDailyPoint> {
+    Ok(UserUsageDailyPoint {
+        bucket_start: get(row, "bucket_start")?,
+        request_count: to_u64(get::<i64>(row, "request_count")?)?,
+        success_count: to_u64(get::<i64>(row, "success_count")?)?,
+        failure_count: to_u64(get::<i64>(row, "failure_count")?)?,
+        total_tokens: to_u64(get::<i64>(row, "total_tokens")?)?,
+        billed_usd: optional_decimal(row, "billed_usd")?,
+        billed_known_count: to_u64(get::<i64>(row, "billed_known_count")?)?,
+        billed_unknown_count: to_u64(get::<i64>(row, "billed_unknown_count")?)?,
+    })
+}
+
+pub(crate) fn admin_user_usage_record(
+    record: UserUsageRecord,
+) -> AdminStoreResult<admin_observability::UserUsageRecord> {
+    Ok(admin_observability::UserUsageRecord {
+        id: record.id,
+        client_api_key_ref: record.client_api_key_ref,
+        client_api_key_name: record.client_api_key_name,
+        operation: record.operation,
+        request_kind: record.request_kind,
+        requested_model_id: record.requested_model_id,
+        input_tokens: record.input_tokens,
+        output_tokens: record.output_tokens,
+        cached_tokens: record.cached_tokens,
+        cache_write_tokens: record.cache_write_tokens,
+        reasoning_tokens: record.reasoning_tokens,
+        image_input_tokens: record.image_input_tokens,
+        image_output_tokens: record.image_output_tokens,
+        total_tokens: record.total_tokens,
+        // 3.12 当前 model_requests 没有图像尺寸/张数事实；保持未知，不用默认值伪造。
+        image_requested_size: None,
+        image_requested_count: None,
+        image_output_size: None,
+        image_count: None,
+        image_billing_tier: None,
+        downstream_rate_multiplier: admin_optional_decimal_amount(
+            record.downstream_rate_multiplier,
+        )?,
+        downstream_billed_amount: admin_optional_decimal_amount(record.downstream_billed_amount)?,
+        outcome: admin_request_outcome(&record.outcome)?,
+        client_status_code: record.client_status_code,
+        latency_ms: record.latency_ms,
+        started_at: record.started_at,
+        completed_at: record.completed_at,
+    })
+}
+
+pub(crate) fn admin_user_usage_page(
+    page: UserUsageRecordPage,
+) -> AdminStoreResult<admin_observability::UserUsagePage> {
+    Ok(admin_observability::UserUsagePage {
+        items: page
+            .items
+            .into_iter()
+            .map(admin_user_usage_record)
+            .collect::<AdminStoreResult<Vec<_>>>()?,
+        current_page: page.current_page,
+        page_size: page.page_size,
+        total: page.total,
+    })
+}
+
+pub(crate) fn admin_user_usage_summary(
+    summary: UserUsageSummary,
+) -> AdminStoreResult<admin_observability::UserUsageSummary> {
+    let map_points = |points: Vec<UserUsageDailyPoint>| {
+        points
+            .into_iter()
+            .map(|point| {
+                Ok(admin_observability::UserUsageDailyPoint {
+                    bucket_start: point.bucket_start,
+                    request_count: point.request_count,
+                    success_count: point.success_count,
+                    failure_count: point.failure_count,
+                    total_tokens: point.total_tokens,
+                    billed_usd: admin_optional_decimal_amount(point.billed_usd)?,
+                    billed_known_count: point.billed_known_count,
+                    billed_unknown_count: point.billed_unknown_count,
+                })
+            })
+            .collect::<AdminStoreResult<Vec<_>>>()
+    };
+    Ok(admin_observability::UserUsageSummary {
+        range: admin_range(summary.range),
+        request_count: summary.request_count,
+        success_count: summary.success_count,
+        failure_count: summary.failure_count,
+        total_tokens: summary.total_tokens,
+        billed_usd: admin_optional_decimal_amount(summary.billed_usd)?,
+        billed_known_count: summary.billed_known_count,
+        billed_unknown_count: summary.billed_unknown_count,
+        input_tokens: summary.input_tokens,
+        output_tokens: summary.output_tokens,
+        cached_tokens: summary.cached_tokens,
+        average_latency_ms: summary.average_latency_ms,
+        trend_granularity: summary.trend_granularity,
+        trend: map_points(summary.trend)?,
+        daily: map_points(summary.daily)?,
+        models: summary
+            .models
+            .into_iter()
+            .map(|item| admin_observability::UserUsageBreakdown {
+                id: item.id,
+                name: item.name,
+                request_count: item.request_count,
+                total_tokens: item.total_tokens,
+                is_other: item.is_other,
+            })
+            .collect(),
+        client_keys: summary
+            .client_keys
+            .into_iter()
+            .map(|item| admin_observability::UserUsageBreakdown {
+                id: item.id,
+                name: item.name,
+                request_count: item.request_count,
+                total_tokens: item.total_tokens,
+                is_other: item.is_other,
+            })
+            .collect(),
+    })
+}
+
 pub(crate) fn admin_provider_observation(
     observation: ProviderObservation,
 ) -> admin_observability::ProviderObservation {
@@ -780,6 +968,8 @@ pub(crate) fn usage_list_record_from_row(
     row: &sqlx::postgres::PgRow,
 ) -> StoreResult<UsageListRecord> {
     Ok(UsageListRecord {
+        user_id: get(row, "user_id")?,
+        username: get(row, "username")?,
         client_api_key_name: get(row, "client_api_key_name")?,
         billing_snapshot_json: get(row, "billing_snapshot_json")?,
         id: get(row, "id")?,
@@ -834,6 +1024,8 @@ pub(crate) fn usage_record_from_row(row: &sqlx::postgres::PgRow) -> StoreResult<
     Ok(UsageRecord {
         billing_snapshot_json: get(row, "billing_snapshot_json")?,
         id: get(row, "id")?,
+        user_id: get(row, "user_id")?,
+        username: get(row, "username")?,
         client_api_key_ref: get(row, "client_api_key_ref")?,
         config_revision: unsigned(row, "config_revision")?,
         routing_scope: get(row, "routing_scope")?,

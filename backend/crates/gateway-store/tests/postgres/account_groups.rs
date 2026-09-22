@@ -245,6 +245,99 @@ async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multip
 }
 
 #[tokio::test]
+async fn user_group_assignment_blocks_delete_and_is_counted_separately_from_legacy_keys() {
+    const USER_GROUP: &str = "grp_00000000000000000000000000000003";
+    let Some(database) = TestDatabase::create("account_group_user_reference").await else {
+        return;
+    };
+    let groups = PgAccountGroupRepository::new(database.pool.clone());
+    let group = group_id(USER_GROUP);
+    groups
+        .create_account_group(
+            NewAccountGroup {
+                disable_fast: false,
+                id: group.clone(),
+                name: "User Assigned".to_owned(),
+                description: None,
+                color: group_color("#22C55EFF"),
+            },
+            &context("create-user-group"),
+        )
+        .await
+        .expect("create user-assigned group");
+    sqlx::query(
+        "insert into users (id,username,password_hash,role,created_at,updated_at)
+         values ('user_group_reference','group-reference','test-only-hash','user',now(),now())",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("create group reference user");
+    sqlx::query(
+        "insert into user_account_groups (user_id,account_group_id)
+         values ('user_group_reference',$1)",
+    )
+    .bind(USER_GROUP)
+    .execute(&database.pool)
+    .await
+    .expect("assign group to user");
+
+    let page = groups
+        .list_account_groups(AccountGroupListQuery {
+            page: 1,
+            page_size: PageSize::new(20).expect("page size"),
+            search: Some("User Assigned".to_owned()),
+            enabled: None,
+        })
+        .await
+        .expect("list user-assigned group");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].user_count, 1);
+    assert_eq!(page.items[0].client_key_count, 0);
+
+    let revision_before_delete = current_revision(&database.pool).await;
+    let audit_before_delete = audit_count(&database.pool).await;
+    let error = groups
+        .delete_account_group(
+            DeleteAccountGroup { id: group.clone() },
+            &context("delete-user-referenced"),
+        )
+        .await
+        .expect_err("user-referenced group must not be deleted");
+    assert_eq!(error.kind(), AdminStoreErrorKind::Conflict);
+    assert_eq!(
+        current_revision(&database.pool).await,
+        revision_before_delete
+    );
+    assert_eq!(audit_count(&database.pool).await, audit_before_delete);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from user_account_groups where account_group_id=$1",
+        )
+        .bind(USER_GROUP)
+        .fetch_one(&database.pool)
+        .await
+        .expect("count preserved group assignment"),
+        1
+    );
+
+    sqlx::query(
+        "delete from user_account_groups where user_id='user_group_reference' and account_group_id=$1",
+    )
+    .bind(USER_GROUP)
+    .execute(&database.pool)
+    .await
+    .expect("remove group assignment");
+    groups
+        .delete_account_group(
+            DeleteAccountGroup { id: group },
+            &context("delete-unreferenced-user-group"),
+        )
+        .await
+        .expect("unreferenced group can be deleted");
+    database.close().await;
+}
+
+#[tokio::test]
 async fn group_costs_should_include_statusless_websocket_but_reject_statusless_http() {
     let Some(database) = TestDatabase::create("account_group_statusless_websocket_cost").await
     else {

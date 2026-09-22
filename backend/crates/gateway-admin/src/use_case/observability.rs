@@ -24,7 +24,8 @@ use crate::{
             UsageCalculatedBillingFact, UsageDetail, UsageFilter, UsageInsights, UsageInsightsCost,
             UsageInsightsCostPoint, UsageInsightsHealth, UsageInsightsHealthPoint,
             UsageInsightsPerformance, UsageInsightsPerformancePoint, UsageOverview, UsagePage,
-            UsageQuery, UsageSummary, china_day_start,
+            UsageQuery, UsageSummary, UserUsageFilter, UserUsagePage, UserUsageQuery,
+            UserUsageRecord, UserUsageSummary, china_day_start,
         },
         provider_credentials::ProviderQuotaRequest,
     },
@@ -106,6 +107,22 @@ pub trait ObservabilityService: Send + Sync {
     -> Result<Trend, AdminError>;
     async fn usage_records(&self, query: UsageQuery) -> Result<UsagePage, AdminError>;
     async fn usage_record_detail(&self, request_id: &str) -> Result<UsageDetail, AdminError>;
+    async fn user_usage_records(
+        &self,
+        user_id: &str,
+        query: UserUsageQuery,
+    ) -> Result<UserUsagePage, AdminError>;
+    async fn user_usage_record_detail(
+        &self,
+        user_id: &str,
+        request_id: &str,
+    ) -> Result<UserUsageRecord, AdminError>;
+    async fn user_usage_summary(
+        &self,
+        user_id: &str,
+        range: TimeRange,
+        filter: UserUsageFilter,
+    ) -> Result<UserUsageSummary, AdminError>;
     async fn usage_summary(
         &self,
         range: TimeRange,
@@ -296,6 +313,49 @@ impl ObservabilityService for DefaultObservabilityService {
             .map_err(|error| map_store_error(error, "usage record"))?;
         self.enrich_detail_billing(std::slice::from_mut(&mut detail.request));
         Ok(detail)
+    }
+
+    async fn user_usage_records(
+        &self,
+        user_id: &str,
+        query: UserUsageQuery,
+    ) -> Result<UserUsagePage, AdminError> {
+        if user_id.trim().is_empty() {
+            return Err(AdminError::invalid("用户 ID 不能为空"));
+        }
+        self.store
+            .list_user_usage_records(user_id, query)
+            .await
+            .map_err(|error| map_store_error(error, "user usage records"))
+    }
+
+    async fn user_usage_record_detail(
+        &self,
+        user_id: &str,
+        request_id: &str,
+    ) -> Result<UserUsageRecord, AdminError> {
+        if user_id.trim().is_empty() || request_id.trim().is_empty() {
+            return Err(AdminError::invalid("用户或用量记录 ID 不能为空"));
+        }
+        self.store
+            .user_usage_record_detail(user_id, request_id)
+            .await
+            .map_err(|error| map_store_error(error, "user usage record"))
+    }
+
+    async fn user_usage_summary(
+        &self,
+        user_id: &str,
+        range: TimeRange,
+        filter: UserUsageFilter,
+    ) -> Result<UserUsageSummary, AdminError> {
+        if user_id.trim().is_empty() {
+            return Err(AdminError::invalid("用户 ID 不能为空"));
+        }
+        self.store
+            .user_usage_summary(user_id, range, filter)
+            .await
+            .map_err(|error| map_store_error(error, "user usage summary"))
     }
 
     async fn usage_summary(

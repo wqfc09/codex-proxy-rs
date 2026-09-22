@@ -132,6 +132,7 @@ fn push_request_error_predicates(
     // 错误事实独立于请求结束状态；主动取消不属于需要排查的错误。
     // 列表和总数共用此条件，避免流式响应中的错误因 outcome 被漏掉。
     statement.push(" and mr.error_kind is not null and mr.error_kind <> 'cancelled'");
+    push_text_equality(statement, "mr.user_id", &filter.user_id);
     push_range(statement, "mr.completed_at", range);
     for (column, value) in [
         ("mr.client_api_key_ref", &filter.client_api_key_ref),
@@ -159,6 +160,7 @@ fn push_request_error_predicates(
             statement,
             &[
                 "mr.id",
+                "mr.username_snapshot",
                 "mr.client_api_key_ref",
                 "mr.provider_account_ref",
                 "mr.upstream_request_id",
@@ -175,6 +177,7 @@ fn push_ops_event_predicates(
     filter: &OpsErrorFilter,
 ) {
     push_range(statement, "oe.created_at", range);
+    push_text_equality(statement, "mr.user_id", &filter.user_id);
     for (column, value) in [
         ("mr.client_api_key_ref", &filter.client_api_key_ref),
         ("oe.model_request_id", &filter.request_id),
@@ -206,6 +209,7 @@ fn push_ops_event_predicates(
             &[
                 "oe.id",
                 "oe.model_request_id",
+                "mr.username_snapshot",
                 "mr.client_api_key_ref",
                 "oe.provider_account_ref",
                 "oe.upstream_request_id",

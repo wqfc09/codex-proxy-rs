@@ -83,6 +83,14 @@ pub struct ClientKeyListQuery {
     pub sort: ClientKeySort,
 }
 
+/// 已验证 Bearer Key 的只读额度事实；不暴露明文、分组或 Provider 身份配置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientKeyUsageBudgetContext {
+    pub owner_user_id: Option<String>,
+    pub enabled: bool,
+    pub budget: ClientBudgetStatus,
+}
+
 /// 不含完整明文 Key 的管理投影。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientKeyRecord {
@@ -194,6 +202,14 @@ pub struct UpdateClientKey {
     pub limits: RateLimits,
     pub daily_limit_usd: Option<gateway_core::metering::Decimal>,
     pub weekly_limit_usd: Option<gateway_core::metering::Decimal>,
+}
+
+/// 管理员为 owned Key 设置可选的上游身份覆盖；`None` 表示继承 User 默认身份。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceClientKeyIdentity {
+    pub id: ClientApiKeyId,
+    pub openai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
+    pub xai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
 }
 
 /// 修改 Client Key 启用状态。

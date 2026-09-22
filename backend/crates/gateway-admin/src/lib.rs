@@ -30,7 +30,8 @@ pub use use_case::{
     backup::BackupService, client_distribution::ClientDistributionService,
     client_keys::ClientKeyService, import_tasks::ImportTasksService,
     observability::ObservabilityService, openai::OpenAiService, proxies::ProxiesService,
-    settings::SettingsService, system::SystemService, xai::XaiService,
+    settings::SettingsService, subscription_billing::SubscriptionBillingService,
+    system::SystemService, users::UsersService, xai::XaiService,
 };
 
 use model::{AdminError, AdminErrorKind};
@@ -45,7 +46,8 @@ use use_case::{
     auth::DefaultAuthService, backup::DefaultBackupService,
     client_distribution::DefaultClientDistributionService, client_keys::DefaultClientKeyService,
     observability::DefaultObservabilityService, openai::DefaultOpenAiService,
-    settings::DefaultSettingsService, system::DefaultSystemService, xai::DefaultXaiService,
+    settings::DefaultSettingsService, subscription_billing::DefaultSubscriptionBillingService,
+    system::DefaultSystemService, users::DefaultUsersService, xai::DefaultXaiService,
 };
 
 const OPENAI_PROVIDER_KIND: &str = "openai";
@@ -184,10 +186,12 @@ pub enum AdminConfigError {
 pub struct AdminServices {
     proxies: Arc<dyn ProxiesService>,
     auth: Arc<dyn AuthService>,
+    users: Arc<dyn UsersService>,
     key_usage: Arc<dyn KeyUsageService>,
     accounts: Arc<dyn AccountsService>,
     account_groups: Arc<dyn AccountGroupService>,
     client_keys: Arc<dyn ClientKeyService>,
+    subscription_billing: Arc<dyn SubscriptionBillingService>,
     client_distribution: Arc<dyn ClientDistributionService>,
     observability: Arc<dyn ObservabilityService>,
     settings: Arc<dyn SettingsService>,
@@ -226,6 +230,11 @@ impl AdminServices {
     }
 
     #[must_use]
+    pub fn users(&self) -> &dyn UsersService {
+        self.users.as_ref()
+    }
+
+    #[must_use]
     pub fn accounts(&self) -> &dyn AccountsService {
         self.accounts.as_ref()
     }
@@ -238,6 +247,11 @@ impl AdminServices {
     #[must_use]
     pub fn client_keys(&self) -> &dyn ClientKeyService {
         self.client_keys.as_ref()
+    }
+
+    #[must_use]
+    pub fn subscription_billing(&self) -> &dyn SubscriptionBillingService {
+        self.subscription_billing.as_ref()
     }
 
     #[must_use]
@@ -304,6 +318,7 @@ pub struct AdminRuntimePorts {
     pub client_distribution: Arc<dyn ClientDistributionResolver>,
     pub system: Arc<dyn SystemOperations>,
     pub client_key_verifier: Arc<dyn ClientKeyVerifier>,
+    pub turnstile: Arc<dyn ports::auth::TurnstileVerifier>,
 }
 
 /// 校验配置、建立动态 Provider 注册表并完成默认管理员幂等初始化。
@@ -326,6 +341,7 @@ pub async fn initialize(
         client_distribution,
         system,
         client_key_verifier,
+        turnstile,
     } = runtime;
     config
         .resolve_and_validate(Path::new("."))
@@ -341,15 +357,23 @@ pub async fn initialize(
         .require(&provider_kind(XAI_PROVIDER_KIND)?)
         .map_err(map_provider_registry_error)?;
 
+    let auth_store = store.auth();
     let auth = Arc::new(DefaultAuthService::new(
         config.default_username,
         config.session_ttl_minutes,
         client_config.session_ttl_minutes,
-        store.auth(),
-        client_key_verifier.clone(),
+        auth_store.clone(),
+        turnstile,
     ));
     auth.ensure_default_admin(config.default_password.expose())
         .await?;
+    let users = Arc::new(DefaultUsersService::new(
+        auth_store,
+        snapshot.clone(),
+        config.session_ttl_minutes,
+        client_config.session_ttl_minutes,
+        registry.clone(),
+    ));
 
     let accounts = Arc::new(DefaultAccountsService::new(
         store.accounts(),
@@ -375,6 +399,7 @@ pub async fn initialize(
         auth.clone(),
         client_key_verifier,
         store.client_keys(),
+        store.subscription_billing(),
         store.observability(),
         system.clone(),
     ));
@@ -402,6 +427,7 @@ pub async fn initialize(
             registry.clone(),
         )),
         auth,
+        users,
         accounts: accounts.clone(),
         account_groups: Arc::new(DefaultAccountGroupService::new(
             store.account_groups(),
@@ -411,7 +437,10 @@ pub async fn initialize(
         client_keys: Arc::new(DefaultClientKeyService::new(
             store.client_keys(),
             snapshot.clone(),
-            registry.clone(),
+        )),
+        subscription_billing: Arc::new(DefaultSubscriptionBillingService::new(
+            store.subscription_billing(),
+            snapshot.clone(),
         )),
         client_distribution: Arc::new(DefaultClientDistributionService::new(client_distribution)),
         observability: Arc::new(DefaultObservabilityService::new(

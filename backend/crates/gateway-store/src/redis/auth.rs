@@ -21,6 +21,12 @@ end
 return 0
 "#;
 
+const REPLACE_SESSION_SCRIPT: &str = r#"
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[2], 'XX', 'KEEPTTL')
+return 1
+"#;
+
 /// Redis 身份标签只由认证服务写入，不能从请求中的角色声明构造。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -28,6 +34,11 @@ pub enum SessionSubjectRecord {
     Admin {
         admin_user_id: String,
         // 旧会话没有指纹，按未认证处理并要求重新登录。
+        #[serde(default)]
+        credential_fingerprint: String,
+    },
+    User {
+        user_id: String,
         #[serde(default)]
         credential_fingerprint: String,
     },
@@ -41,6 +52,9 @@ impl SessionSubjectRecord {
         match self {
             Self::Admin { admin_user_id, .. } => {
                 require_nonempty("authentication session", "admin_user_id", admin_user_id)
+            }
+            Self::User { user_id, .. } => {
+                require_nonempty("authentication session", "user_id", user_id)
             }
             Self::Key { client_key_id } => {
                 require_nonempty("authentication session", "client_key_id", client_key_id)
@@ -57,7 +71,7 @@ pub struct AuthSessionRecord {
 }
 
 impl AuthSessionRecord {
-    fn validate(&self) -> StoreResult<u64> {
+    fn validate_serializable(&self) -> StoreResult<u64> {
         self.subject.validate()?;
         let expires_at_millis = u64::try_from(self.expires_at.timestamp_millis())
             .map_err(|_| auth_invalid("session expiry must be after the Unix epoch"))?;
@@ -66,6 +80,11 @@ impl AuthSessionRecord {
                 "session expiry is outside the supported range",
             ));
         }
+        Ok(expires_at_millis)
+    }
+
+    fn validate_for_store(&self) -> StoreResult<u64> {
+        let expires_at_millis = self.validate_serializable()?;
         let now_millis = u64::try_from(Utc::now().timestamp_millis())
             .map_err(|_| auth_invalid("current time is outside the supported range"))?;
         if expires_at_millis <= now_millis {
@@ -80,6 +99,12 @@ pub trait AuthStateRepository: Send + Sync {
     async fn load_session(&self, session_id: &str) -> StoreResult<Option<AuthSessionRecord>>;
     async fn store_session(&self, session_id: &str, session: &AuthSessionRecord)
     -> StoreResult<()>;
+    async fn replace_session_if_matches(
+        &self,
+        session_id: &str,
+        expected: &AuthSessionRecord,
+        replacement: &AuthSessionRecord,
+    ) -> StoreResult<bool>;
     async fn delete_session(&self, session_id: &str) -> StoreResult<Option<AuthSessionRecord>>;
     async fn consume_login_attempt(
         &self,
@@ -137,7 +162,7 @@ impl AuthStateRepository for RedisAuthStateRepository {
         session: &AuthSessionRecord,
     ) -> StoreResult<()> {
         let key = self.session_key(session_id)?;
-        let expires_at_millis = session.validate()?;
+        let expires_at_millis = session.validate_for_store()?;
         let payload = encode_session(session)?;
         let mut connection = self.connection.clone();
         redis::cmd("SET")
@@ -149,6 +174,28 @@ impl AuthStateRepository for RedisAuthStateRepository {
             .await
             .map_err(|_| redis_unavailable("store authentication session"))?;
         Ok(())
+    }
+
+    async fn replace_session_if_matches(
+        &self,
+        session_id: &str,
+        expected: &AuthSessionRecord,
+        replacement: &AuthSessionRecord,
+    ) -> StoreResult<bool> {
+        if expected.expires_at != replacement.expires_at {
+            return Err(auth_invalid("session refresh cannot change expiry"));
+        }
+        replacement.validate_serializable()?;
+        let key = self.session_key(session_id)?;
+        let mut connection = self.connection.clone();
+        let changed: u8 = Script::new(REPLACE_SESSION_SCRIPT)
+            .key(key)
+            .arg(encode_session(expected)?)
+            .arg(encode_session(replacement)?)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(|_| redis_unavailable("replace authentication session"))?;
+        Ok(changed == 1)
     }
 
     async fn delete_session(&self, session_id: &str) -> StoreResult<Option<AuthSessionRecord>> {

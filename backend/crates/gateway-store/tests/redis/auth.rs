@@ -47,7 +47,14 @@ async fn client_session_should_use_fixed_ttl_without_storing_session_or_api_key_
         .query_async::<i64>(&mut connection)
         .await
         .expect("read client session ttl");
-    assert!((1..=60_000).contains(&ttl));
+    assert!(ttl > 0);
+    // PXAT 固定的是绝对到期时间；应用与 Redis 的时钟不必毫秒级相等。
+    let expires_at = redis::cmd("PEXPIRETIME")
+        .arg(key)
+        .query_async::<i64>(&mut connection)
+        .await
+        .expect("read absolute session expiry");
+    assert_eq!(expires_at, session.expires_at.timestamp_millis());
     let payload = redis::cmd("GET")
         .arg(key)
         .query_async::<String>(&mut connection)
@@ -63,6 +70,108 @@ async fn client_session_should_use_fixed_ttl_without_storing_session_or_api_key_
             .await
             .expect("delete client session"),
         Some(session)
+    );
+}
+
+#[tokio::test]
+async fn password_session_refresh_preserves_expiry_and_never_resurrects_a_removed_session() {
+    let Some((repository, mut connection, namespace)) = auth_repository().await else {
+        return;
+    };
+    let previous = AuthSessionRecord {
+        subject: SessionSubjectRecord::User {
+            user_id: "refresh_user".to_owned(),
+            credential_fingerprint: "old-hash:1".to_owned(),
+        },
+        expires_at: Utc::now() + chrono::Duration::minutes(5),
+    };
+    let replacement = AuthSessionRecord {
+        subject: SessionSubjectRecord::User {
+            user_id: "refresh_user".to_owned(),
+            credential_fingerprint: "new-hash:2".to_owned(),
+        },
+        expires_at: previous.expires_at,
+    };
+    repository
+        .store_session("refresh", &previous)
+        .await
+        .unwrap();
+    assert!(
+        repository
+            .replace_session_if_matches("refresh", &previous, &replacement)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        repository.load_session("refresh").await.unwrap(),
+        Some(replacement.clone())
+    );
+    assert!(
+        !repository
+            .replace_session_if_matches("refresh", &previous, &replacement)
+            .await
+            .unwrap()
+    );
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("{namespace}:*"))
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(keys.len(), 1);
+    let expires: i64 = redis::cmd("PEXPIRETIME")
+        .arg(&keys[0])
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(expires, previous.expires_at.timestamp_millis());
+    let extended = AuthSessionRecord {
+        expires_at: replacement.expires_at + chrono::Duration::minutes(1),
+        ..replacement.clone()
+    };
+    assert!(
+        repository
+            .replace_session_if_matches("refresh", &replacement, &extended)
+            .await
+            .is_err()
+    );
+    repository.delete_session("refresh").await.unwrap();
+    assert!(
+        !repository
+            .replace_session_if_matches("refresh", &previous, &replacement)
+            .await
+            .unwrap()
+    );
+    assert!(repository.load_session("refresh").await.unwrap().is_none());
+    repository
+        .store_session("refresh", &previous)
+        .await
+        .unwrap();
+    redis::cmd("PEXPIREAT")
+        .arg(&keys[0])
+        .arg(1)
+        .query_async::<i64>(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        !repository
+            .replace_session_if_matches("refresh", &previous, &replacement)
+            .await
+            .unwrap()
+    );
+    assert!(repository.load_session("refresh").await.unwrap().is_none());
+
+    let expired = AuthSessionRecord {
+        subject: SessionSubjectRecord::User {
+            user_id: "expired_user".to_owned(),
+            credential_fingerprint: "expired-hash:1".to_owned(),
+        },
+        expires_at: Utc::now() - chrono::Duration::milliseconds(1),
+    };
+    assert!(
+        !repository
+            .replace_session_if_matches("already-expired", &expired, &expired)
+            .await
+            .expect("expired/missing session should be a CAS miss, not invalid data")
     );
 }
 
@@ -206,7 +315,14 @@ async fn admin_auth_state_keeps_fixed_ttl_and_opaque_keys() {
             .query_async::<i64>(&mut connection)
             .await
             .expect("read key ttl");
-        assert!((1..=60_000).contains(&ttl));
+        assert!(ttl > 0);
+        // PXAT 固定的是绝对到期时间；应用与 Redis 的时钟不必毫秒级相等。
+        let expires_at = redis::cmd("PEXPIRETIME")
+            .arg(key)
+            .query_async::<i64>(&mut connection)
+            .await
+            .expect("read absolute session expiry");
+        assert_eq!(expires_at, session.expires_at.timestamp_millis());
         let value = redis::cmd("GET")
             .arg(key)
             .query_async::<String>(&mut connection)

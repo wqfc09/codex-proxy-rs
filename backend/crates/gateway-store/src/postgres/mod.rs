@@ -19,6 +19,7 @@ mod client_budgets;
 mod client_keys;
 mod execution;
 mod execution_buffer;
+mod identity;
 mod observability;
 mod ops_events;
 mod pricing;
@@ -27,6 +28,7 @@ mod proxies;
 mod retention;
 mod runtime_settings;
 mod snapshot;
+mod subscription_billing;
 mod usage_facts;
 
 pub use account_groups::*;
@@ -37,6 +39,7 @@ pub use client_budgets::PgClientBudgetStore;
 pub use client_keys::*;
 pub use execution::*;
 pub use execution_buffer::*;
+pub use identity::*;
 pub use observability::*;
 pub use ops_events::*;
 pub use provider_accounts::*;
@@ -44,6 +47,7 @@ pub use proxies::PgProxyRepository;
 pub use retention::*;
 pub use runtime_settings::*;
 pub use snapshot::*;
+pub use subscription_billing::*;
 pub(crate) use usage_facts::{
     completed_usage_fact_predicate, push_completed_usage_fact_filter,
     push_unrecovered_request_filter,
@@ -264,6 +268,7 @@ impl ControlPlaneRepository for PgControlPlaneRepository {
             ControlPlaneMutation::SetClientApiKeyEnabled {
                 id: id.to_owned(),
                 enabled,
+                owner_user_id: None,
             },
             audit,
         )
@@ -276,7 +281,10 @@ impl ControlPlaneRepository for PgControlPlaneRepository {
         audit: AdminAuditEvent,
     ) -> StoreResult<Revision> {
         self.apply_targeted_mutation(
-            ControlPlaneMutation::DeleteClientApiKey(id.to_owned()),
+            ControlPlaneMutation::DeleteClientApiKey {
+                id: id.to_owned(),
+                owner_user_id: None,
+            },
             audit,
         )
         .await
@@ -286,8 +294,15 @@ impl ControlPlaneRepository for PgControlPlaneRepository {
 enum ControlPlaneMutation {
     CreateClientApiKey(NewClientApiKey),
     UpdateClientApiKey(UpdateClientApiKeyDetails),
-    SetClientApiKeyEnabled { id: String, enabled: bool },
-    DeleteClientApiKey(String),
+    SetClientApiKeyEnabled {
+        id: String,
+        enabled: bool,
+        owner_user_id: Option<String>,
+    },
+    DeleteClientApiKey {
+        id: String,
+        owner_user_id: Option<String>,
+    },
     SetAdminApiKey(Option<String>),
 }
 
@@ -336,12 +351,26 @@ impl PgControlPlaneRepository {
                     }
                     update_client_api_key_in_transaction(&mut transaction, &key).await?;
                 }
-                ControlPlaneMutation::SetClientApiKeyEnabled { id, enabled } => {
-                    set_client_api_key_enabled_in_transaction(&mut transaction, &id, enabled)
-                        .await?;
+                ControlPlaneMutation::SetClientApiKeyEnabled {
+                    id,
+                    enabled,
+                    owner_user_id,
+                } => {
+                    set_client_api_key_enabled_in_transaction_for_owner(
+                        &mut transaction,
+                        &id,
+                        enabled,
+                        owner_user_id.as_deref(),
+                    )
+                    .await?;
                 }
-                ControlPlaneMutation::DeleteClientApiKey(id) => {
-                    delete_client_api_key_in_transaction(&mut transaction, &id).await?;
+                ControlPlaneMutation::DeleteClientApiKey { id, owner_user_id } => {
+                    delete_client_api_key_in_transaction_for_owner(
+                        &mut transaction,
+                        &id,
+                        owner_user_id.as_deref(),
+                    )
+                    .await?;
                 }
                 ControlPlaneMutation::SetAdminApiKey(key) => {
                     update_admin_api_key_in_transaction(&mut transaction, key).await?;

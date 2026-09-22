@@ -19,8 +19,10 @@ mod client_keys;
 mod execution;
 mod execution_buffer;
 mod health;
+mod identity;
 mod observability;
 mod ops_events;
+mod owned_keys;
 mod pricing;
 mod provider_accounts;
 mod proxies;
@@ -30,6 +32,7 @@ mod runtime_settings;
 mod schema_integrity;
 mod snapshot;
 mod snapshots;
+mod subscription_billing;
 
 static TEST_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 

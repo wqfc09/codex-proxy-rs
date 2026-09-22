@@ -7,6 +7,7 @@ pub mod pricing;
 pub mod proxy_probe;
 pub mod serve;
 pub mod system_update;
+mod turnstile;
 pub mod workers;
 
 use std::sync::Arc;
@@ -26,6 +27,7 @@ use self::client_distribution::RgAdguardClientDistribution;
 use self::logging::{LogGuard, initialize_logging};
 use self::serve::{ConnectionTracker, serve_router};
 use self::system_update::ProcessSystemOperations;
+use self::turnstile::HttpTurnstileVerifier;
 use self::workers::WorkerSupervisor;
 
 /// Host 初始化的能力集；字段全部私有，不暴露内部监督器或进程状态。
@@ -37,6 +39,7 @@ pub struct HostBundle {
     workers: WorkerSupervisor,
     system: Arc<ProcessSystemOperations>,
     client_distribution: Arc<RgAdguardClientDistribution>,
+    turnstile: Arc<HttpTurnstileVerifier>,
 }
 
 /// 在启动其他包之前初始化进程级能力。
@@ -50,6 +53,7 @@ pub async fn initialize(config: HostConfig) -> Result<HostBundle, HostError> {
         config.system_update.clone(),
     ));
     let client_distribution = Arc::new(RgAdguardClientDistribution::new());
+    let turnstile = Arc::new(HttpTurnstileVerifier::new()?);
     Ok(HostBundle {
         config,
         log_guard,
@@ -58,6 +62,7 @@ pub async fn initialize(config: HostConfig) -> Result<HostBundle, HostError> {
         workers,
         system,
         client_distribution,
+        turnstile,
     })
 }
 
@@ -81,6 +86,11 @@ impl HostBundle {
     /// 返回惰性下载解析能力；网络请求只会在管理 API 调用时发生。
     pub fn client_distribution_resolver(&self) -> Arc<dyn ClientDistributionResolver> {
         self.client_distribution.clone()
+    }
+
+    #[must_use]
+    pub fn turnstile_verifier(&self) -> Arc<dyn gateway_admin::ports::auth::TurnstileVerifier> {
+        self.turnstile.clone()
     }
 
     #[must_use]
@@ -143,6 +153,8 @@ impl HostBundle {
 pub enum HostError {
     #[error(transparent)]
     Logging(#[from] logging::LogError),
+    #[error(transparent)]
+    Turnstile(#[from] turnstile::TurnstileClientError),
     #[error(transparent)]
     Workers(#[from] workers::WorkerStartError),
     #[error(transparent)]

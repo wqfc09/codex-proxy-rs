@@ -462,7 +462,8 @@ async fn quota_plan_changes_survive_inflight_background_and_manual_token_refresh
     repository.insert_provider_account(seed).await.unwrap();
     let original = repository.get_account(&id).await.unwrap().unwrap();
     let config_revision = current_revision(&database.pool).await;
-    let observed_at = SystemTime::now();
+    // 模拟应用侧时钟领先数据库一秒，凭据刷新不能倒退更新时间。
+    let observed_at = SystemTime::now() + std::time::Duration::from_secs(1);
     let observation = QuotaObservation {
         account_id: id.clone(),
         expected_revision: original.revision(),

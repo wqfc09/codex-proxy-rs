@@ -88,6 +88,7 @@ pub struct AccountGroupRecord {
     pub member_count: u64,
     pub provider_counts: BTreeMap<String, u64>,
     pub client_key_count: u64,
+    pub user_count: u64,
     pub account_summary: AccountGroupAccountSummary,
     pub capacity: AccountGroupCapacity,
     pub usage: AccountGroupUsage,
@@ -141,7 +142,7 @@ pub struct SetAccountGroupEnabled {
     pub enabled: bool,
 }
 
-/// Delete an account group that is not referenced by a client key.
+/// Delete an account group that is not referenced by any User or legacy direct Client Key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteAccountGroup {
     pub id: AccountGroupId,

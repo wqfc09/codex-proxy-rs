@@ -242,6 +242,16 @@ impl ClientRoutingScope {
             provider_kinds: Arc::new(provider_kinds),
         })
     }
+
+    /// 用户绑定范围允许为空；空用户分组必须保持空权限，而不是退化为全账号。
+    #[must_use]
+    pub fn restricted_empty() -> Self {
+        Self::Restricted {
+            bound_groups: Arc::from([]),
+            enabled_group_ids: Arc::new(BTreeSet::new()),
+            provider_kinds: Arc::new(BTreeSet::new()),
+        }
+    }
 }
 
 /// 一次认证随 RuntimeSnapshot 冻结的账号目录与 Key 权限。
