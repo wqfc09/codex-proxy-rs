@@ -10,10 +10,11 @@ import BaseSelect from '@/components/base/BaseSelect.vue'
 import { errorMessage } from '@/utils/async'
 import ClientProfilePreviewPanel from './ClientProfilePreviewPanel.vue'
 
-const props = withDefaults(defineProps<{ active?: boolean, disabled?: boolean, allowInherit?: boolean }>(), {
+const props = withDefaults(defineProps<{ active?: boolean, disabled?: boolean, allowInherit?: boolean, inheritLabel?: string, inheritSelection?: XaiClientProfileSelection | null }>(), {
   active: true,
   disabled: false,
   allowInherit: false,
+  inheritLabel: '全局配置',
 })
 const model = defineModel<XaiClientProfileSelection | null>({ required: true })
 const globalConfiguration = shallowRef<XaiClientProfileSelection>()
@@ -34,6 +35,8 @@ const source = computed({
   set: (value: string) => {
     if (value === 'global')
       model.value = null
+    else if (props.inheritSelection)
+      model.value = { ...props.inheritSelection }
     else if (globalConfiguration.value)
       model.value = { ...globalConfiguration.value }
   },
@@ -104,7 +107,7 @@ onMounted(() => props.allowInherit && void load())
         v-model="source"
         label="xAI 客户端身份来源"
         class="shrink-0"
-        :options="[{ label: '全局配置', value: 'global' }, { label: '独立配置', value: 'independent' }]"
+        :options="[{ label: inheritLabel, value: 'global' }, { label: '独立配置', value: 'independent' }]"
         :disabled="disabled || !globalConfiguration"
       />
       <slot name="source-extra" />

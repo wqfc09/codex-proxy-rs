@@ -5,6 +5,7 @@ import { RouterView, useRoute } from 'vue-router'
 
 import AppAboutModal from '@/components/AppAboutModal.vue'
 import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
+import { useAuthStore } from '@/stores/modules/auth'
 import { useSystemUpdateStore } from '@/stores/modules/system-update'
 import { useUiStore } from '@/stores/modules/ui'
 
@@ -13,6 +14,7 @@ import FloatingSidebarToggle from './components/FloatingSidebarToggle.vue'
 import SystemUpdateModal from './components/SystemUpdateModal/index.vue'
 
 const uiStore = useUiStore()
+const authStore = useAuthStore()
 const systemUpdateStore = useSystemUpdateStore()
 const { sidebarCollapsed } = storeToRefs(uiStore)
 const { loadedOnce, version } = storeToRefs(systemUpdateStore)
@@ -33,6 +35,8 @@ function closeMobileSidebar() {
 }
 
 async function openSystemUpdate() {
+  if (!authStore.isAdmin)
+    return
   if (systemUpdateOpen.value || systemUpdateOpening.value)
     return
 
@@ -51,7 +55,8 @@ async function openSystemUpdate() {
 }
 
 onMounted(() => {
-  void systemUpdateStore.loadVersion().catch(() => undefined)
+  if (authStore.isAdmin)
+    void systemUpdateStore.loadVersion().catch(() => undefined)
 })
 
 onBeforeUnmount(() => {
@@ -111,7 +116,7 @@ watch(
     </Teleport>
 
     <AppAboutModal v-model="aboutOpen" :version="version" />
-    <SystemUpdateModal v-model="systemUpdateOpen" />
+    <SystemUpdateModal v-if="authStore.isAdmin" v-model="systemUpdateOpen" />
   </div>
 </template>
 

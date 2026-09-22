@@ -37,6 +37,9 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
   const searchQuery = shallowRef('')
   const search = computed(() => searchQuery.value.trim() || undefined)
   const providerQuery = shallowRef('')
+  const userIdQuery = shallowRef('')
+  const clientApiKeyIdQuery = shallowRef('')
+  const accountIdQuery = shallowRef('')
   let tableParams = snapshot()
   const refreshingList = shallowRef(false)
   const diagnosticDimension = shallowRef('model')
@@ -50,6 +53,9 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
   const scopedParams = () => ({
     ...options.timeRangeParams.value,
     ...(providerQuery.value ? { provider: providerQuery.value } : {}),
+    ...(userIdQuery.value.trim() ? { userId: userIdQuery.value.trim() } : {}),
+    ...(clientApiKeyIdQuery.value.trim() ? { clientApiKeyId: clientApiKeyIdQuery.value.trim() } : {}),
+    ...(accountIdQuery.value.trim() ? { accountId: accountIdQuery.value.trim() } : {}),
   })
   const usagePagination = computed(() => ({
     currentPage: currentPage.value,
@@ -62,6 +68,9 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
       ...options.latestTimeRangeParams(),
       provider: providerQuery.value || undefined,
       search: search.value,
+      userId: userIdQuery.value.trim() || undefined,
+      clientApiKeyId: clientApiKeyIdQuery.value.trim() || undefined,
+      accountId: accountIdQuery.value.trim() || undefined,
     }
   }
 
@@ -188,8 +197,15 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
     return loadUsageRecords({ scope: 'table' })
   }
 
+  function filtersChanged() {
+    return tableParams.search !== search.value
+      || tableParams.userId !== (userIdQuery.value.trim() || undefined)
+      || tableParams.clientApiKeyId !== (clientApiKeyIdQuery.value.trim() || undefined)
+      || tableParams.accountId !== (accountIdQuery.value.trim() || undefined)
+  }
+
   function handlePageChange(nextPage: number) {
-    if (tableParams.search !== search.value) {
+    if (filtersChanged()) {
       void reloadLatestTable()
       return
     }
@@ -199,7 +215,7 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
 
   function handlePageSizeChange(nextPageSize: number) {
     pageSize.value = nextPageSize
-    if (tableParams.search !== search.value) {
+    if (filtersChanged()) {
       void reloadLatestTable()
       return
     }
@@ -218,6 +234,15 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
   watch(providerQuery, () => {
     void loadUsageRecords({ background: true })
   })
+
+  watchDebounced(
+    [userIdQuery, clientApiKeyIdQuery, accountIdQuery],
+    () => {
+      if (!disposed && filtersChanged())
+        void loadUsageRecords()
+    },
+    { debounce: 250 },
+  )
 
   watch(options.active, (active) => {
     if (active) {
@@ -253,6 +278,9 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
     pageSize,
     searchQuery,
     providerQuery,
+    userIdQuery,
+    clientApiKeyIdQuery,
+    accountIdQuery,
     usagePagination,
     loading,
     analyticsLoading,

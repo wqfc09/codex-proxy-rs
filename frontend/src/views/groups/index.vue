@@ -33,7 +33,7 @@ const {
   batchDeleting,
   disabling,
   updatingStatusGroupIds,
-  referencedKeyNames,
+  referencedUserNames,
   openCreate,
   openEdit,
   save,
@@ -55,7 +55,7 @@ const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll 
     <BasePageHeader
       class="h-17"
       title="分组管理"
-      description="将账号归类管理，并为每个 API 密钥指定可使用的账号"
+      description="将上游账号归类管理，并分配给用户作为可用账号范围"
     />
 
     <BaseCard
@@ -194,7 +194,7 @@ const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll 
     <BaseConfirmModal
       v-model="showDisableModal"
       title="禁用账号分组"
-      description="禁用后，使用该分组的 API 密钥将无法再使用其中的账号"
+      description="禁用后，引用该分组的用户及历史直绑密钥将无法再使用其中的账号"
       confirm-text="确认禁用"
       :loading="disabling"
       @confirm="confirmDisable"
@@ -202,11 +202,14 @@ const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll 
       <p class="m-0">
         确定禁用“{{ pendingDisableGroup?.name }}”吗？
       </p>
-      <p v-if="referencedKeyNames.length > 0" class="mt-2 mb-0 text-cp-warning-text">
-        将影响 {{ referencedKeyNames.length }} 个 API 密钥：{{ referencedKeyNames.join('、') }}
+      <p v-if="referencedUserNames.length > 0" class="mt-2 mb-0 text-cp-warning-text">
+        将影响 {{ referencedUserNames.length }} 个用户：{{ referencedUserNames.join('、') }}
       </p>
-      <p v-else-if="pendingDisableGroup?.clientKeyCount" class="mt-2 mb-0 text-cp-warning-text">
-        将影响 {{ pendingDisableGroup.clientKeyCount }} 个 API 密钥
+      <p v-else-if="pendingDisableGroup?.userCount" class="mt-2 mb-0 text-cp-warning-text">
+        将影响 {{ pendingDisableGroup.userCount }} 个用户
+      </p>
+      <p v-if="pendingDisableGroup?.clientKeyCount" class="mt-2 mb-0 text-cp-warning-text">
+        另有 {{ pendingDisableGroup.clientKeyCount }} 个历史 API 密钥直接引用该分组
       </p>
     </BaseConfirmModal>
 
@@ -221,6 +224,15 @@ const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll 
     >
       <p class="m-0">
         确定删除“{{ pendingDeleteGroup?.name || '该分组' }}”吗？账号本身不会被删除
+      </p>
+      <p v-if="referencedUserNames.length > 0" class="mt-2 mb-0 text-cp-warning-text">
+        当前仍被 {{ referencedUserNames.length }} 个用户引用：{{ referencedUserNames.join('、') }}，需先解除分配
+      </p>
+      <p v-else-if="pendingDeleteGroup?.userCount" class="mt-2 mb-0 text-cp-warning-text">
+        当前仍被 {{ pendingDeleteGroup.userCount }} 个用户引用，需先解除分配
+      </p>
+      <p v-if="pendingDeleteGroup?.clientKeyCount" class="mt-2 mb-0 text-cp-warning-text">
+        当前仍被 {{ pendingDeleteGroup.clientKeyCount }} 个历史 API 密钥直接引用，需先解除引用
       </p>
     </BaseConfirmModal>
   </div>

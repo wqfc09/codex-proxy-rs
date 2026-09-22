@@ -2,9 +2,10 @@
 import { onMounted } from 'vue'
 import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
 import { useAdminApiKey } from '../composables/useAdminApiKey'
+import { useLoginSecuritySettings } from '../composables/useLoginSecuritySettings'
 import AdminApiKeyCard from './AdminApiKeyCard.vue'
-import AdminPasswordCard from './AdminPasswordCard.vue'
 import ClientVersionSettings from './client-version/index.vue'
+import LoginSecurityCard from './LoginSecurityCard.vue'
 import ResponseBodyLimitCard from './ResponseBodyLimitCard.vue'
 
 defineProps<{
@@ -19,6 +20,24 @@ const minCodexCliVersion = defineModel<string>('minCodexCliVersion', { required:
 const responsesMaxDecompressedBodyMiB = defineModel<string>('responsesMaxDecompressedBodyMiB', { required: true })
 
 const {
+  loading: securityLoading,
+  sessionSaving,
+  turnstileSaving,
+  error: securityError,
+  adminMinutes,
+  userMinutes,
+  turnstileEnabled,
+  turnstileSiteKey,
+  turnstileSecretKey,
+  turnstileHasSecret,
+  sessionValid,
+  turnstileValid,
+  load: loadSecuritySettings,
+  saveSessionTtl,
+  saveTurnstile,
+} = useLoginSecuritySettings()
+
+const {
   loading: adminKeyLoading,
   regenerating,
   deleting,
@@ -31,12 +50,30 @@ const {
   loadStatus,
 } = useAdminApiKey()
 
-onMounted(loadStatus)
+onMounted(() => {
+  void loadStatus()
+  void loadSecuritySettings()
+})
 </script>
 
 <template>
   <div class="grid min-w-0 gap-5">
-    <AdminPasswordCard />
+    <LoginSecurityCard
+      v-model:admin-minutes="adminMinutes"
+      v-model:user-minutes="userMinutes"
+      v-model:turnstile-enabled="turnstileEnabled"
+      v-model:turnstile-site-key="turnstileSiteKey"
+      v-model:turnstile-secret-key="turnstileSecretKey"
+      :loading="securityLoading"
+      :session-saving="sessionSaving"
+      :turnstile-saving="turnstileSaving"
+      :error="securityError"
+      :turnstile-has-secret="turnstileHasSecret"
+      :session-valid="sessionValid"
+      :turnstile-valid="turnstileValid"
+      @save-session="saveSessionTtl"
+      @save-turnstile="saveTurnstile"
+    />
 
     <AdminApiKeyCard
       :status="status"

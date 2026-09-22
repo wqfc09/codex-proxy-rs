@@ -1,16 +1,18 @@
 <script setup lang="ts">
 import type { ApiKey } from '@/api'
-import { ref, shallowRef, watch } from 'vue'
+import { onMounted, ref, shallowRef } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
 import ApiKeyConfigModal from '@/components/ApiKeyConfigModal.vue'
+import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
 import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
+import BaseEmpty from '@/components/base/BaseEmpty.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
 import BaseTable from '@/components/base/BaseTable/index.vue'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
-import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
 import { usePageSelection } from '@/composables/usePageSelection'
 import ApiKeyActions from './components/ApiKeyActions.vue'
 import ApiKeyBudgetCell from './components/ApiKeyBudgetCell.vue'
@@ -19,7 +21,6 @@ import ApiKeyCreateModal from './components/ApiKeyCreateModal.vue'
 import ApiKeyFilters from './components/ApiKeyFilters.vue'
 import ApiKeyIdentityCell from './components/ApiKeyIdentityCell.vue'
 import ApiKeyPrefixCell from './components/ApiKeyPrefixCell.vue'
-import ApiKeyScopeCell from './components/ApiKeyScopeCell.vue'
 import ApiKeyStatusBadge from './components/ApiKeyStatusBadge.vue'
 import { useApiKeyMutations } from './composables/useApiKeyMutations'
 import { useApiKeysQuery } from './composables/useApiKeysQuery'
@@ -36,6 +37,7 @@ function openBudgetReset(key: ApiKey) {
 }
 const {
   loading,
+  error: loadError,
   apiKeys,
   loadApiKeys,
   searchQuery,
@@ -47,17 +49,10 @@ const {
 } = useApiKeysQuery()
 
 const {
-  groups,
-  loading: loadingGroups,
-  loadGroups,
-} = useAccountGroupCatalog({ immediate: false })
-
-const {
   showFormModal,
   showDeleteModal,
   showSingleDeleteModal,
   showKeyModal,
-  showAllAccountsConfirm,
   createdKey,
   createdKeyName,
   editingKey,
@@ -71,7 +66,6 @@ const {
   openCreate,
   openEdit,
   requestSave,
-  confirmAllAccountsScope,
   requestDeleteKey,
   handleDelete,
   handleBatchDelete,
@@ -99,10 +93,15 @@ const {
   revealPlaintextKey,
 })
 
-watch(
-  showFormModal,
-  open => open && void loadGroups(),
-)
+const route = useRoute()
+const router = useRouter()
+onMounted(() => {
+  if (route.query.create === '1') {
+    openCreate()
+    const { create: _create, ...query } = route.query
+    void router.replace({ path: route.path, query })
+  }
+})
 </script>
 
 <template>
@@ -110,11 +109,11 @@ watch(
     <BasePageHeader
       class="h-17"
       title="API 密钥"
-      description="创建和管理 API 密钥，并设置每个密钥可以使用的账号"
+      description="管理自己的调用密钥；分组与上游身份由账户统一继承"
     />
 
     <BaseCard
-      class="mt-5 flex h-[calc(100dvh-136px)] min-h-125 flex-col"
+      class="mt-4 flex h-[max(22rem,calc(100dvh-136px))] min-h-0 flex-col"
     >
       <template #header>
         <ApiKeyFilters
@@ -127,7 +126,14 @@ watch(
       </template>
 
       <template #body>
-        <div class="flex h-full min-h-0 flex-col">
+        <BaseEmpty v-if="loadError" title="API Key 加载失败" :description="loadError" class="my-auto">
+          <template #action>
+            <BaseButton :loading="loading" @click="loadApiKeys">
+              重新加载
+            </BaseButton>
+          </template>
+        </BaseEmpty>
+        <div v-else class="flex h-full min-h-0 flex-col">
           <BaseTable
             class="min-h-0 flex-1"
             :columns="apiKeyColumns"
@@ -162,9 +168,6 @@ watch(
                 :revealing="revealingKeyIds.has(row.id)"
                 @copy="copyApiKey(row)"
               />
-            </template>
-            <template #scope="{ row }">
-              <ApiKeyScopeCell :api-key="row" />
             </template>
             <template #budget="{ row }">
               <ApiKeyBudgetCell :api-key="row" />
@@ -220,8 +223,6 @@ watch(
       v-model="showFormModal"
       v-model:created-open="showKeyModal"
       v-model:form="form"
-      :groups="groups"
-      :group-loading="loadingGroups"
       :editing="Boolean(editingKey)"
       :created-key="createdKey"
       :saving="savingKey"
@@ -242,19 +243,6 @@ watch(
       :api-base-url="openAiBaseUrl"
       @copy="copyToClipboard"
     />
-
-    <BaseConfirmModal
-      v-model="showAllAccountsConfirm"
-      title="授予全部账号权限"
-      description="保存后，该密钥可以使用所有账号"
-      confirm-text="确认授予全部账号"
-      :loading="savingKey"
-      @confirm="confirmAllAccountsScope"
-    >
-      <p class="m-0">
-        该密钥可以使用所有账号，包括以后新增和未分组的账号
-      </p>
-    </BaseConfirmModal>
 
     <BaseConfirmModal
       v-model="showDeleteModal"

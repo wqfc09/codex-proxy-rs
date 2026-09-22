@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { Eye, EyeOff, KeyRound, Mail, ShieldCheck } from '@lucide/vue'
-import { computed, shallowRef, watch } from 'vue'
+import { Eye, EyeOff, KeyRound, Mail } from '@lucide/vue'
+import { computed, shallowRef } from 'vue'
 
 import AppBrandMark from '@/components/AppBrandMark.vue'
 import BaseButton from '@/components/base/BaseButton.vue'
@@ -8,9 +8,7 @@ import BaseCard from '@/components/base/BaseCard.vue'
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
 import BaseMotionIcon from '@/components/base/BaseMotionIcon.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
 
-type LoginRealm = 'admin' | 'key'
 type SecretInputType = 'password' | 'text'
 
 const props = defineProps<{
@@ -22,33 +20,13 @@ const emit = defineEmits<{
   submit: []
 }>()
 
-const realm = defineModel<LoginRealm>('realm', { required: true })
 const username = defineModel<string>('username', { required: true })
 const password = defineModel<string>('password', { required: true })
-const apiKey = defineModel<string>('apiKey', { required: true })
 const isSecretVisible = shallowRef(false)
 
-const realmOptions = [
-  { label: '管理员登录', value: 'admin', icon: ShieldCheck },
-  { label: 'API Key 登录', value: 'key', icon: KeyRound },
-]
-
-const isKeyRealm = computed(() => realm.value === 'key')
-const realmCaption = computed(() => isKeyRealm.value ? 'KEY REALM' : 'ADMIN REALM')
 const secretType = computed<SecretInputType>(() => (isSecretVisible.value ? 'text' : 'password'))
-const secretToggleLabel = computed(() => {
-  const target = isKeyRealm.value ? 'API Key' : '密码'
-  return `${isSecretVisible.value ? '隐藏' : '显示'}${target}`
-})
-const submitLabel = computed(() => {
-  if (props.loading)
-    return '正在登录...'
-  return '登录'
-})
-
-watch(realm, () => {
-  isSecretVisible.value = false
-})
+const secretToggleLabel = computed(() => `${isSecretVisible.value ? '隐藏' : '显示'}密码`)
+const submitLabel = computed(() => props.loading ? '正在登录...' : '登录')
 
 function toggleSecretVisible(): void {
   isSecretVisible.value = !isSecretVisible.value
@@ -75,21 +53,11 @@ function toggleSecretVisible(): void {
           >
             Codex Proxy RS
           </strong>
-          <span class="font-mono text-[10px] leading-[1.2] font-normal text-(--cp-login-brand-caption-color) ml-0.5">
-            {{ realmCaption }}
+          <span class="font-mono text-[10px] leading-[1.2] font-normal text-(--cp-login-brand-caption-color)">
+            CONTROL PLANE
           </span>
         </span>
       </div>
-
-      <BaseSegmented
-        v-model="realm"
-        class="w-18 shrink-0 [--cp-color-bg-container:var(--cp-color-bg-elevated)] [--cp-color-fill-tertiary:var(--cp-login-input-bg)] [--cp-control-height-sm:34px] [&_svg]:size-4"
-        label="选择登录方式"
-        :options="realmOptions"
-        display="icon"
-        size="sm"
-        :disabled="loading"
-      />
     </header>
 
     <section class="grid min-h-18 min-w-0 content-start gap-4" aria-labelledby="login-title">
@@ -105,64 +73,30 @@ function toggleSecretVisible(): void {
     </section>
 
     <div class="grid gap-3">
-      <template v-if="!isKeyRealm">
-        <div class="grid min-w-0 gap-2">
-          <span id="admin-username-label" class="text-cp leading-[1.1] font-bold text-(--cp-login-label-color)">管理员账号</span>
-          <BaseInput
-            v-model="username"
-            name="username"
-            aria-label="管理员账号"
-            placeholder="输入会话账号"
-            autocomplete="username"
-          >
-            <template #prefix>
-              <Mail :size="17" />
-            </template>
-          </BaseInput>
-        </div>
-
-        <div class="grid min-w-0 gap-2">
-          <span class="text-cp leading-[1.1] font-bold text-(--cp-login-label-color)">访问密钥</span>
-          <BaseInput
-            v-model="password"
-            name="password"
-            aria-label="访问密钥"
-            placeholder="输入会话密钥"
-            :type="secretType"
-            autocomplete="current-password"
-          >
-            <template #prefix>
-              <KeyRound :size="17" />
-            </template>
-            <template #suffix>
-              <BaseIconButton
-                variant="ghost"
-                size="sm"
-                class="login-password-toggle"
-                :label="secretToggleLabel"
-                @mousedown.prevent
-                @click="toggleSecretVisible"
-              >
-                <EyeOff v-if="isSecretVisible" :size="16" />
-                <Eye v-else :size="16" />
-              </BaseIconButton>
-            </template>
-          </BaseInput>
-        </div>
-      </template>
-
-      <div v-else class="grid min-w-0 gap-2">
-        <span id="client-api-key-label" class="text-cp leading-[1.1] font-bold text-(--cp-login-label-color)">访问密钥</span>
+      <div class="grid min-w-0 gap-2">
+        <span class="text-cp leading-[1.1] font-bold text-(--cp-login-label-color)">账号</span>
         <BaseInput
-          id="client-api-key"
-          v-model="apiKey"
-          name="apiKey"
-          aria-labelledby="client-api-key-label"
-          placeholder="输入 API Key"
+          v-model="username"
+          name="username"
+          aria-label="账号"
+          placeholder="输入登录账号"
+          autocomplete="username"
+        >
+          <template #prefix>
+            <Mail :size="17" />
+          </template>
+        </BaseInput>
+      </div>
+
+      <div class="grid min-w-0 gap-2">
+        <span class="text-cp leading-[1.1] font-bold text-(--cp-login-label-color)">密码</span>
+        <BaseInput
+          v-model="password"
+          name="password"
+          aria-label="密码"
+          placeholder="输入登录密码"
           :type="secretType"
-          autocomplete="off"
-          autocapitalize="none"
-          spellcheck="false"
+          autocomplete="current-password"
         >
           <template #prefix>
             <KeyRound :size="17" />
@@ -182,7 +116,10 @@ function toggleSecretVisible(): void {
           </template>
         </BaseInput>
       </div>
-      <div class="min-w-0">
+
+      <slot name="protection" />
+
+      <div class="min-w-0 mb-2">
         <BaseButton
           variant="primary"
           size="lg"

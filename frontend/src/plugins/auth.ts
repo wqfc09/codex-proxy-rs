@@ -10,11 +10,10 @@ export const authPlugin: Plugin = {
     const authStore = useAuthStore(pinia)
 
     setUnauthorizedHandler(async () => {
-      const loginMode = authStore.session?.role ?? 'admin'
       authStore.invalidateSession()
 
       if (router.currentRoute.value.name !== 'login')
-        await router.replace({ name: 'login', state: { loginMode } })
+        await router.replace({ name: 'login', query: { redirect: router.currentRoute.value.fullPath } })
     })
   },
 }

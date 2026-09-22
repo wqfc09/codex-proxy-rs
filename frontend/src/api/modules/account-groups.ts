@@ -30,6 +30,7 @@ export interface AccountGroup extends AccountGroupRef {
   memberCount: number
   providerCounts: Record<string, number>
   clientKeyCount: number
+  userCount: number
   accountSummary: AccountGroupAccountSummary
   capacity: AccountGroupCapacity
   usage: AccountGroupUsage

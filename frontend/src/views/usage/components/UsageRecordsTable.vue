@@ -1,4 +1,4 @@
-<script setup lang="ts">
+<script setup lang="ts" generic="T extends UsageDisplayRecord">
 import type { UsageDisplayRecord } from '../utils/records'
 import type { BaseTableColumn } from '@/components/base/BaseTable/columns'
 import { Minimize2 } from '@lucide/vue'
@@ -21,8 +21,8 @@ import UsageTransportBadge from './UsageTransportBadge.vue'
 // 使用记录表只负责该领域的单元格呈现；筛选与分页由页面组合。
 withDefaults(
   defineProps<{
-    columns: BaseTableColumn<UsageDisplayRecord>[]
-    rows: UsageDisplayRecord[]
+    columns: BaseTableColumn<T>[]
+    rows: T[]
     loading?: boolean
     emptyText?: string
   }>(),
@@ -40,12 +40,18 @@ withDefaults(
     :loading="loading"
     :empty-text="emptyText"
   >
-    <template #clientApiKeyName="{ displayValue }">
+    <template #username="{ row }">
+      <span class="block max-w-full truncate font-emphasis text-cp-text" :title="row.userId || undefined">
+        {{ row.username || row.userId || 'Legacy / 无用户' }}
+      </span>
+    </template>
+
+    <template #clientApiKeyName="{ row }">
       <span
-        class="block max-w-full truncate font-mono text-cp-sm leading-none font-bold text-cp-text"
-        :title="String(displayValue)"
+        class="block max-w-full truncate font-emphasis text-cp-text"
+        :title="row.clientApiKeyId || undefined"
       >
-        {{ displayValue }}
+        {{ row.clientApiKeyName || row.clientApiKeyId || '未记录' }}
       </span>
     </template>
 
@@ -118,6 +124,12 @@ withDefaults(
 
     <template #billing="{ row }">
       <UsageBillingCell :record="row" />
+    </template>
+
+    <template #downstreamBilledAmount="{ row }">
+      <span class="font-mono tabular-nums text-cp-text">
+        {{ row.downstreamBilledAmount == null ? '未知' : `$${row.downstreamBilledAmount}` }}
+      </span>
     </template>
 
     <template #latency="{ row }">

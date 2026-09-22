@@ -1,57 +1,92 @@
-import type { AuthSession } from '@/api'
+import type { AuthSession, LoginParam, SessionUser } from '@/api'
+import type { AppRole } from '@/router/access'
 
 import { defineStore } from 'pinia'
 import { computed, shallowRef } from 'vue'
 
-import { login as apiLogin, logout as apiLogout, getAuthStatus } from '@/api'
+import {
+  login as apiLogin,
+  logout as apiLogout,
+  getAuthStatus,
+  getCurrentUser,
+} from '@/api'
 import { resetUnauthorizedHandling } from '@/api/request'
+import { defaultRouteForRole } from '@/router/access'
 
 export const useAuthStore = defineStore('auth', () => {
   const session = shallowRef<AuthSession | null>(null)
-  const isAuthenticated = computed(() => session.value !== null)
-  const isAdmin = computed(() => session.value?.role === 'admin')
+  const currentUser = shallowRef<SessionUser | null>(null)
   const sessionChecked = shallowRef(false)
   const loading = shallowRef(false)
   let revision = 0
   let pendingCheck: Promise<boolean> | undefined
 
+  const isAuthenticated = computed(() => session.value !== null && currentUser.value !== null)
+  const role = computed<AppRole | null>(() => session.value?.role ?? null)
+  const isAdmin = computed(() => role.value === 'admin')
+  const isUser = computed(() => role.value === 'user')
+  const defaultRoute = computed(() => defaultRouteForRole(role.value))
+
+  function clearSession() {
+    session.value = null
+    currentUser.value = null
+  }
+
   function checkAuth(): Promise<boolean> {
     if (pendingCheck)
       return pendingCheck
+
     const currentRevision = revision
-    const check = getAuthStatus().then((status) => {
-      // 登录或退出之后到达的旧状态响应，不覆盖新会话。
-      if (currentRevision === revision) {
-        session.value = status.session
+    const check = (async () => {
+      const status = await getAuthStatus({ silent: true })
+      if (currentRevision !== revision)
+        return isAuthenticated.value
+
+      if (!status.authenticated || !status.session) {
+        clearSession()
         sessionChecked.value = true
-        if (status.authenticated)
-          resetUnauthorizedHandling()
+        return false
       }
-      return isAuthenticated.value
-    }).finally(() => {
+
+      const user = await getCurrentUser({ silent: true })
+      if (currentRevision !== revision)
+        return isAuthenticated.value
+
+      session.value = status.session
+      currentUser.value = user
+      sessionChecked.value = true
+      resetUnauthorizedHandling()
+      return true
+    })().finally(() => {
       if (pendingCheck === check)
         pendingCheck = undefined
     })
+
     pendingCheck = check
     return check
   }
 
-  async function login(payload: Parameters<typeof apiLogin>[0]) {
+  async function login(payload: LoginParam) {
     if (loading.value)
       return null
+
     revision += 1
     pendingCheck = undefined
     loading.value = true
     try {
       const result = await apiLogin(payload)
+      const user = await getCurrentUser({ silent: true })
       revision += 1
       pendingCheck = undefined
       session.value = result
+      currentUser.value = user
       sessionChecked.value = true
       resetUnauthorizedHandling()
       return result
     }
     catch {
+      clearSession()
+      sessionChecked.value = true
       return null
     }
     finally {
@@ -62,16 +97,17 @@ export const useAuthStore = defineStore('auth', () => {
   async function logout() {
     if (loading.value)
       return false
+
     loading.value = true
     revision += 1
     pendingCheck = undefined
     try {
-      await apiLogout()
+      await apiLogout({ silent: true })
       invalidateSession()
       return true
     }
     catch {
-      // 只有服务端确认撤销后才退出，避免刷新又恢复一个未撤销的会话。
+      // 只有服务端确认撤销后才清空本地身份，避免刷新后恢复未撤销会话。
       return false
     }
     finally {
@@ -79,13 +115,33 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
+  function updateCurrentUser(user: SessionUser) {
+    if (currentUser.value?.id === user.id)
+      currentUser.value = user
+  }
+
   function invalidateSession() {
     revision += 1
     pendingCheck = undefined
-    session.value = null
+    clearSession()
     sessionChecked.value = true
     resetUnauthorizedHandling()
   }
 
-  return { session, isAuthenticated, isAdmin, sessionChecked, loading, checkAuth, login, logout, invalidateSession }
+  return {
+    session,
+    currentUser,
+    isAuthenticated,
+    sessionChecked,
+    loading,
+    role,
+    isAdmin,
+    isUser,
+    defaultRoute,
+    checkAuth,
+    login,
+    logout,
+    updateCurrentUser,
+    invalidateSession,
+  }
 })

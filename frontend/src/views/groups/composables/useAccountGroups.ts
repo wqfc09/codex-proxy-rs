@@ -1,4 +1,4 @@
-import type { AccountGroup, ApiKey } from '@/api'
+import type { AccountGroup, UserManagementSummary } from '@/api'
 import { watchDebounced } from '@vueuse/core'
 import { computed, onMounted, ref, shallowRef, watch } from 'vue'
 
@@ -8,7 +8,7 @@ import {
   disableAccountGroup,
   enableAccountGroup,
   getAccountGroups,
-  getApiKeys,
+  getAdminUsersManagement,
   updateAccountGroup,
 } from '@/api'
 import { toast } from '@/components/base/BaseToast'
@@ -38,7 +38,7 @@ export function useAccountGroups() {
   const editingGroup = shallowRef<AccountGroup | null>(null)
   const pendingDeleteGroup = shallowRef<AccountGroup | null>(null)
   const pendingDisableGroup = shallowRef<AccountGroup | null>(null)
-  const clientKeys = shallowRef<ApiKey[]>([])
+  const groupUsers = shallowRef<UserManagementSummary[]>([])
   const form = ref<AccountGroupFormValue>(emptyForm())
   const savingAction = useAsyncAction()
   const deletingAction = useAsyncAction()
@@ -71,32 +71,37 @@ export function useAccountGroups() {
   const batchDeleting = batchDeletingAction.loading
   const disabling = disablingAction.loading
   const updatingStatusGroupIds = updatingStatusGroups.ids
-  const referencedKeyNames = computed(() => {
+  const referencedUserNames = computed(() => {
     const groupId = pendingDisableGroup.value?.id ?? pendingDeleteGroup.value?.id
     if (!groupId)
       return []
-    return referenceKeyNamesFor(groupId)
+    return referenceUserNamesFor(groupId)
   })
 
-  function referenceKeyNamesFor(groupId: string) {
-    return clientKeys.value
-      .filter(key => key.groups.some(group => group.id === groupId))
-      .map(key => key.name || key.prefix)
+  function referenceUserNamesFor(groupId: string) {
+    return groupUsers.value
+      .filter(user => user.groups.some(group => group.groupId === groupId))
+      .map(user => user.username)
   }
 
-  async function loadReferenceKeys() {
+  async function loadReferenceUsers() {
     try {
-      const items: ApiKey[] = []
-      let cursor: string | undefined
+      const items: UserManagementSummary[] = []
+      let page = 1
+      let total = 0
       do {
-        const result = await getApiKeys({ limit: 200, cursor })
+        const result = await getAdminUsersManagement({ page, pageSize: 100 })
         items.push(...result.items)
-        cursor = result.nextCursor ?? undefined
-      } while (cursor)
-      clientKeys.value = items
+        total = result.total
+        page += 1
+        if (!result.items.length)
+          break
+      } while (items.length < total)
+      groupUsers.value = items
     }
     catch {
-      clientKeys.value = []
+      groupUsers.value = []
+      toast.warning('分组引用账户未能加载；修改分组仍可能影响已有用户及历史密钥。')
     }
   }
 
@@ -149,7 +154,7 @@ export function useAccountGroups() {
       showFormModal.value = false
       editingGroup.value = null
       form.value = emptyForm()
-      await Promise.all([query.execute(), loadReferenceKeys()])
+      await Promise.all([query.execute(), loadReferenceUsers()])
       toast.success(updating ? '分组已更新' : '分组已创建')
     })
   }
@@ -275,7 +280,7 @@ export function useAccountGroups() {
   })
 
   onMounted(() => {
-    void Promise.all([query.execute(), loadReferenceKeys()])
+    void Promise.all([query.execute(), loadReferenceUsers()])
   })
 
   return {
@@ -298,7 +303,7 @@ export function useAccountGroups() {
     batchDeleting,
     disabling,
     updatingStatusGroupIds,
-    referencedKeyNames,
+    referencedUserNames,
     openCreate,
     openEdit,
     save,

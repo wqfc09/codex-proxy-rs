@@ -1,14 +1,9 @@
 import type { RequestOptions } from '../request'
-import type { AccountGroupRef } from './account-groups'
-import type { ClientProfileSelection, XaiClientProfileSelection } from './client-profiles'
 import request from '../request'
 
-export type ApiKeyRoutingScope = 'all' | 'groups'
 export type ApiKeyBudgetPeriod = 'daily' | 'weekly' | 'all'
 
 export interface ApiKey {
-  openaiClientProfileOverride: ClientProfileSelection | null
-  xaiClientProfileOverride: XaiClientProfileSelection | null
 
   id: string
   name: string
@@ -26,8 +21,6 @@ export interface ApiKey {
   createdAt: string
   updatedAt: string
   lastUsedAt: string | null
-  routingScope: ApiKeyRoutingScope
-  groups: AccountGroupRef[]
   providerKinds: string[]
 }
 
@@ -62,12 +55,9 @@ interface ApiKeyListParams {
 }
 
 export interface ApiKeyWriteParam {
-  openaiClientProfileOverride: ClientProfileSelection | null
-  xaiClientProfileOverride: XaiClientProfileSelection | null
 
   name: string
   label: string | null
-  groupIds: string[]
   maxConcurrency: number
   requestsPerMinute: number
   dailyLimitUsd: string
@@ -86,9 +76,9 @@ interface ApiKeyIdParam {
   id: string
 }
 
-export function getApiKeys(data: ApiKeyListParams, options: RequestOptions = {}) {
+export function getApiKeys(data: ApiKeyListParams = { limit: 100 }, options: RequestOptions = {}) {
   return request<ApiKeyListResponse>({
-    url: '/api/admin/client-keys',
+    url: '/api/user/client-keys',
     method: 'GET',
     params: data,
     ...options,
@@ -97,7 +87,7 @@ export function getApiKeys(data: ApiKeyListParams, options: RequestOptions = {})
 
 export function createApiKey(data: ApiKeyCreateParam) {
   return request<ApiKeyCreateResponse>({
-    url: '/api/admin/client-keys/create',
+    url: '/api/user/client-keys/create',
     method: 'POST',
     data,
   })
@@ -105,7 +95,7 @@ export function createApiKey(data: ApiKeyCreateParam) {
 
 export function updateApiKey(data: ApiKeyUpdateParam) {
   return request<ApiKeyMutationResponse>({
-    url: '/api/admin/client-keys/update',
+    url: '/api/user/client-keys/update',
     method: 'POST',
     data,
   })
@@ -113,7 +103,7 @@ export function updateApiKey(data: ApiKeyUpdateParam) {
 
 export function revealApiKey(data: ApiKeyIdParam) {
   return request<ApiKeyRevealResponse>({
-    url: '/api/admin/client-keys/reveal',
+    url: '/api/user/client-keys/reveal',
     method: 'GET',
     params: data,
   })
@@ -121,7 +111,7 @@ export function revealApiKey(data: ApiKeyIdParam) {
 
 export function deleteApiKey(data: ApiKeyIdParam) {
   return request<ApiKeyMutationResponse>({
-    url: '/api/admin/client-keys/delete',
+    url: '/api/user/client-keys/delete',
     method: 'POST',
     data,
   })
@@ -129,7 +119,7 @@ export function deleteApiKey(data: ApiKeyIdParam) {
 
 export function resetApiKeyBudget(data: ApiKeyIdParam & { period: ApiKeyBudgetPeriod }) {
   return request<ApiKeyMutationResponse>({
-    url: '/api/admin/client-keys/reset-budget',
+    url: '/api/user/client-keys/reset-budget',
     method: 'POST',
     data,
   })
@@ -137,7 +127,7 @@ export function resetApiKeyBudget(data: ApiKeyIdParam & { period: ApiKeyBudgetPe
 
 export function disableApiKey(data: ApiKeyIdParam) {
   return request<ApiKeyMutationResponse>({
-    url: '/api/admin/client-keys/disable',
+    url: '/api/user/client-keys/disable',
     method: 'POST',
     data,
   })
@@ -145,7 +135,7 @@ export function disableApiKey(data: ApiKeyIdParam) {
 
 export function enableApiKey(data: ApiKeyIdParam) {
   return request<ApiKeyMutationResponse>({
-    url: '/api/admin/client-keys/enable',
+    url: '/api/user/client-keys/enable',
     method: 'POST',
     data,
   })

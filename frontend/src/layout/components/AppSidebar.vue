@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import {
   ArrowUpCircle,
+  BadgeDollarSign,
   ChartNoAxesColumn,
+  CircleUserRound,
   FolderTree,
   Info,
   KeyRound,
@@ -26,9 +28,11 @@ import AppBrandMark from '@/components/AppBrandMark.vue'
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BaseMotionIcon from '@/components/base/BaseMotionIcon.vue'
 import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
+import { isNavigationItemActive, navigationForRole, workspaceForRoute } from '@/router/access'
 import { useAuthStore } from '@/stores/modules/auth'
 import { useSystemUpdateStore } from '@/stores/modules/system-update'
 import { useThemeStore } from '@/stores/modules/theme'
+import AppWorkspaceSwitch from './AppWorkspaceSwitch.vue'
 
 const props = withDefaults(
   defineProps<{
@@ -57,25 +61,40 @@ const { effectiveTheme } = storeToRefs(themeStore)
 const { toggleTheme } = themeStore
 const preferredMotion = usePreferredReducedMotion()
 
-const navItems = [
-  { label: '概览', icon: LayoutDashboard, path: '/' },
-  { label: '账号管理', icon: Users, path: '/accounts' },
-  { label: '代理管理', icon: Network, path: '/proxies' },
-  { label: '分组管理', icon: FolderTree, path: '/groups' },
-  { label: 'API 密钥', icon: KeyRound, path: '/keys' },
-  { label: '使用统计', icon: ChartNoAxesColumn, path: '/usage' },
-  { label: '主题设置', icon: Palette, path: '/theme' },
-  { label: '系统设置', icon: Settings, path: '/settings' },
-]
+const navIconMap = {
+  dashboard: LayoutDashboard,
+  accounts: Users,
+  proxies: Network,
+  groups: FolderTree,
+  keys: KeyRound,
+  usage: ChartNoAxesColumn,
+  users: Users,
+  plans: BadgeDollarSign,
+  profile: CircleUserRound,
+  theme: Palette,
+  settings: Settings,
+} as const
+const workspace = computed({
+  get: () => workspaceForRoute(authStore.role, route.path) ?? 'user',
+  set: (value: string) => {
+    if (!authStore.isAdmin || (value !== 'admin' && value !== 'user') || value === workspace.value)
+      return
+    navigate(value === 'admin' ? '/' : '/user')
+  },
+})
+const navItems = computed(() =>
+  navigationForRole(authStore.role, workspaceForRoute(authStore.role, route.path)).map(item => ({
+    ...item,
+    icon: navIconMap[item.icon],
+  })),
+)
 
 function isActive(path: string) {
-  if (path === '/')
-    return route.path === '/'
-  return route.path.startsWith(path)
+  return isNavigationItemActive(route.path, path)
 }
 
 const activeNavIndex = computed(() => {
-  const index = navItems.findIndex(item => isActive(item.path))
+  const index = navItems.value.findIndex(item => isActive(item.path))
   return Math.max(0, index)
 })
 const activeNavIndicatorStyle = computed(() => ({
@@ -341,7 +360,7 @@ onBeforeUnmount(() => {
         <span class="mt-1.5 flex h-4.5 min-w-0 items-center gap-2">
           <span class="shrink-0 text-xs leading-none font-emphasis text-cp-text-secondary"> Rust build </span>
           <button
-            v-if="hasVersionLabel"
+            v-if="workspace === 'admin' && hasVersionLabel"
             type="button"
             class="inline-flex h-4.5 min-w-0 cursor-pointer items-center gap-1 rounded-cp-sm border-0 px-1.5 font-mono text-[10px] leading-none font-bold transition-colors outline-none focus-visible:ring-2 focus-visible:ring-cp-control-outline focus-visible:ring-offset-2 focus-visible:ring-offset-cp-bg-container"
             :class="[
@@ -359,7 +378,11 @@ onBeforeUnmount(() => {
       </span>
     </div>
 
-    <BaseScrollbar class="my-6 w-full flex-1">
+    <div v-if="authStore.isAdmin" class="mx-4 mt-5 shrink-0" :class="isCollapsed ? 'w-14 self-center' : 'self-stretch'">
+      <AppWorkspaceSwitch v-model="workspace" :collapsed="isCollapsed" />
+    </div>
+
+    <BaseScrollbar class="my-5 w-full flex-1">
       <div class="px-4">
         <nav class="relative grid gap-3" :class="isCollapsed ? 'mx-auto w-11.5' : 'w-full'" aria-label="主导航">
           <span
@@ -386,6 +409,9 @@ onBeforeUnmount(() => {
                   ? 'bg-transparent font-semibold text-cp-text-secondary transition-none'
                   : 'bg-transparent font-semibold text-cp-text-secondary transition-colors duration-200 hover:bg-cp-fill-quaternary hover:text-cp-text',
             ]"
+            :aria-label="item.label"
+            :aria-current="isActive(item.path) ? 'page' : undefined"
+            :title="isCollapsed ? item.label : undefined"
             @click="navigate(item.path)"
           >
             <component :is="item.icon" class="shrink-0" :size="20" />
@@ -415,7 +441,7 @@ onBeforeUnmount(() => {
 
         <div class="flex items-center" :class="isCollapsed ? 'grid gap-1' : 'gap-1'">
           <BaseIconButton
-            v-if="isCollapsed && hasUpdate"
+            v-if="workspace === 'admin' && isCollapsed && hasUpdate"
             variant="success"
             size="md"
             :label="updateButtonLabel"

@@ -1,6 +1,5 @@
 import type { Ref } from 'vue'
 import type { getApiKeys } from '@/api'
-import type { ClientProfileSelection, XaiClientProfileSelection } from '@/api/modules/client-profiles'
 import { ref, shallowRef, watch } from 'vue'
 import {
   createApiKey,
@@ -18,12 +17,9 @@ import { useIdSet } from '@/composables/useIdSet'
 type ApiKeyRow = Awaited<ReturnType<typeof getApiKeys>>['items'][number]
 
 export interface ApiKeyFormValue {
-  openaiClientProfileOverride: ClientProfileSelection | null
-  xaiClientProfileOverride: XaiClientProfileSelection | null
   customKey: string
   name: string
   label: string
-  groupIds: string[]
   maxConcurrency: string
   requestsPerMinute: string
   dailyLimitUsd: string
@@ -39,7 +35,6 @@ export function useApiKeyMutations(options: {
   const showDeleteModal = shallowRef(false)
   const showSingleDeleteModal = shallowRef(false)
   const showKeyModal = shallowRef(false)
-  const showAllAccountsConfirm = shallowRef(false)
   const createdKey = shallowRef('')
   const createdKeyName = shallowRef('')
   const editingKey = shallowRef<ApiKeyRow | null>(null)
@@ -65,12 +60,9 @@ export function useApiKeyMutations(options: {
   function openEdit(key: ApiKeyRow) {
     editingKey.value = key
     form.value = {
-      openaiClientProfileOverride: key.openaiClientProfileOverride ? { ...key.openaiClientProfileOverride } : null,
-      xaiClientProfileOverride: key.xaiClientProfileOverride ? { ...key.xaiClientProfileOverride } : null,
       customKey: '',
       name: key.name,
       label: key.label ?? '',
-      groupIds: key.groups.map(group => group.id),
       maxConcurrency: limitInputValue(key.maxConcurrency),
       requestsPerMinute: limitInputValue(key.requestsPerMinute),
       dailyLimitUsd: limitInputValue(key.dailyLimitUsd),
@@ -82,16 +74,7 @@ export function useApiKeyMutations(options: {
   function requestSave() {
     if (!validateForm() || savingKey.value)
       return
-    if (form.value.groupIds.length === 0) {
-      showAllAccountsConfirm.value = true
-      return
-    }
     void save()
-  }
-
-  async function confirmAllAccountsScope() {
-    showAllAccountsConfirm.value = false
-    await save()
   }
 
   async function save() {
@@ -101,11 +84,8 @@ export function useApiKeyMutations(options: {
     await savingKeyAction.run(
       async () => {
         const payload = {
-          openaiClientProfileOverride: form.value.openaiClientProfileOverride,
-          xaiClientProfileOverride: form.value.xaiClientProfileOverride,
           name: form.value.name.trim(),
           label: form.value.label.trim() || null,
-          groupIds: [...new Set(form.value.groupIds)],
           maxConcurrency: parseLimit(form.value.maxConcurrency),
           requestsPerMinute: parseLimit(form.value.requestsPerMinute),
           dailyLimitUsd: form.value.dailyLimitUsd.trim() || '0',
@@ -274,7 +254,6 @@ export function useApiKeyMutations(options: {
     showDeleteModal,
     showSingleDeleteModal,
     showKeyModal,
-    showAllAccountsConfirm,
     createdKey,
     createdKeyName,
     editingKey,
@@ -288,7 +267,6 @@ export function useApiKeyMutations(options: {
     openCreate,
     openEdit,
     requestSave,
-    confirmAllAccountsScope,
     requestDeleteKey,
     handleDelete,
     handleBatchDelete,
@@ -301,12 +279,9 @@ export function useApiKeyMutations(options: {
 
 function emptyForm(): ApiKeyFormValue {
   return {
-    openaiClientProfileOverride: null,
-    xaiClientProfileOverride: null,
     customKey: '',
     name: '',
     label: '',
-    groupIds: [],
     maxConcurrency: '',
     requestsPerMinute: '',
     dailyLimitUsd: '',

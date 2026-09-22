@@ -16,7 +16,7 @@ function buildUsageScript(apiKey: string, baseUrl: string) {
   // 按本次导入值生成字符串字面量，并转义左花括号，避免值中的占位符被二次替换。
   const url = JSON.stringify(`${baseUrl}/usage`).replaceAll('{', '\\u007b')
   const authorization = JSON.stringify(`Bearer ${apiKey}`).replaceAll('{', '\\u007b')
-  // 不限额时省略 total / remaining，避免把无限额度显示成余额为零。
+  // CPR 同时受 User/Plan 与 Key 多窗口约束；只展示当前真正可用的最小剩余额度。
   return `({
   request: {
     url: ${url},
@@ -24,22 +24,18 @@ function buildUsageScript(apiKey: string, baseUrl: string) {
     headers: { Authorization: ${authorization} }
   },
   extractor: function(response) {
-    return [["daily", "日额度"], ["weekly", "周额度"]].map(function(entry) {
-      var budget = response[entry[0]];
-      var result = {
-        planName: entry[1],
-        isValid: true,
-        used: Number(budget.used),
-        unit: response.unit
-      };
-      if (budget.total === null) {
-        result.extra = "不限额";
-      } else {
-        result.total = Number(budget.total);
-        result.remaining = Number(budget.remaining);
-      }
-      return result;
-    });
+    var available = response.available;
+    var result = {
+      planName: "可用额度",
+      isValid: true,
+      unit: response.unit
+    };
+    if (!available || available.remaining === null) {
+      result.extra = "不限额";
+    } else {
+      result.remaining = Number(available.remaining);
+    }
+    return result;
   }
 })`
 }

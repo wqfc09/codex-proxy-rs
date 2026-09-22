@@ -18,7 +18,7 @@ export function useApiKeysQuery() {
     }>
   >([])
   const request = useRequestState()
-  const { loading } = request
+  const { loading, error } = request
   const cursors = new Map<number, string | undefined>([[1, undefined]])
 
   const apiKeyPagination = computed(() => ({
@@ -47,7 +47,7 @@ export function useApiKeysQuery() {
       search,
       sortBy: sort.value?.key,
       sortDirection: sort.value?.direction,
-    }, { signal })
+    }, { signal, silent: true })
   }
 
   function applyPage(result: Awaited<ReturnType<typeof getApiKeys>>, targetPage: number) {
@@ -95,7 +95,8 @@ export function useApiKeysQuery() {
       applyPage(result, currentPage)
       return true
     }
-    catch {
+    catch (error) {
+      request.fail(requestId, error)
       return false
     }
     finally {
@@ -136,6 +137,7 @@ export function useApiKeysQuery() {
 
   return {
     loading,
+    error,
     apiKeys,
     loadApiKeys: reloadFromStart,
     searchQuery,

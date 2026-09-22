@@ -75,7 +75,20 @@ export interface UsageRecordMetadata {
 }
 
 export interface UsageListRecord {
+  userId: string | null
+  username: string | null
+  clientApiKeyId: string | null
   clientApiKeyName: string | null
+  subscriptionId: string | null
+  billingGroupId: string | null
+  downstreamRateMultiplier: string | null
+  downstreamBilledAmount: string | null
+  imageRequestedSize: string | null
+  imageRequestedCount: number | null
+  imageOutputSize: string | null
+  imageCount: number | null
+  imageBillingTier: string | null
+  imageBaseCostSource: string | null
   id: string
   provider: string | null
   authenticationKind: string | null
@@ -110,6 +123,18 @@ export interface UsageRecord {
   id: string
   requestId: string
   clientApiKeyId: string | null
+  userId: string | null
+  username: string | null
+  subscriptionId: string | null
+  billingGroupId: string | null
+  downstreamRateMultiplier: string | null
+  downstreamBilledAmount: string | null
+  imageRequestedSize: string | null
+  imageRequestedCount: number | null
+  imageOutputSize: string | null
+  imageCount: number | null
+  imageBillingTier: string | null
+  imageBaseCostSource: string | null
   kind: string
   provider: string | null
   authenticationKind: string | null
@@ -467,6 +492,9 @@ interface UsageRangeQuery {
   model?: string
   statusCode?: number
   search?: string
+  userId?: string
+  clientApiKeyId?: string
+  accountId?: string
 }
 
 interface PageQuery {

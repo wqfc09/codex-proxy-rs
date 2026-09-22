@@ -6,7 +6,8 @@ import { formatProvider } from './utils/format'
 type OpsErrorRow = OpsError
 
 export const usageRecordColumns = defineTableColumns<UsageDisplayRecord>([
-  { key: 'clientApiKeyName', label: '密钥名称', kind: 'identity', size: 'xl' },
+  { key: 'username', label: '用户', kind: 'identity', size: 'xl', emptyText: 'Legacy / 无用户' },
+  { key: 'clientApiKeyName', label: '密钥名称', kind: 'identity', size: 'xl', emptyText: '未记录' },
   {
     key: 'accountEmail',
     hideable: false,
@@ -27,7 +28,8 @@ export const usageRecordColumns = defineTableColumns<UsageDisplayRecord>([
   { key: 'upstreamTransport', label: '上游', kind: 'status', size: 'md' },
   { key: 'clientTransport', label: '接入', kind: 'status', size: 'md' },
   { key: 'tokenDetails', label: 'TOKEN', kind: 'numeric', size: 'xl' },
-  { key: 'billing', label: '费用', kind: 'numeric', size: 'xl' },
+  { key: 'billing', label: 'Provider 费用', kind: 'numeric', size: 'lg' },
+  { key: 'downstreamBilledAmount', label: '用户计费', kind: 'numeric', size: 'lg', emptyText: '未知' },
   { key: 'latency', label: '延迟', kind: 'numeric', size: 'xl' },
   { key: 'createdAtDisplay', label: '时间', kind: 'datetime' },
   { key: 'clientIp', label: 'IP', kind: 'custom', size: '3xl' },

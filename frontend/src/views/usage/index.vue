@@ -35,6 +35,9 @@ const {
   currentPage,
   searchQuery,
   providerQuery,
+  userIdQuery,
+  clientApiKeyIdQuery,
+  accountIdQuery,
   usagePagination,
   loading,
   analyticsLoading,
@@ -109,6 +112,9 @@ watch(timeRange, () => {
         >
           <UsageFilters
             v-model:search="searchQuery"
+            v-model:user-id="userIdQuery"
+            v-model:client-api-key-id="clientApiKeyIdQuery"
+            v-model:account-id="accountIdQuery"
             :loading="loading"
             :refreshing="refreshingList"
             @refresh="refreshUsageRecords"

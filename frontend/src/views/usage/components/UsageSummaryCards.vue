@@ -1,14 +1,18 @@
 <script setup lang="ts">
-import type { getUsageRecordSummary } from '@/api'
+import type { getUsageRecordSummary, UserUsageSummary } from '@/api'
 import { Activity, Database, FileText, Timer } from '@lucide/vue'
 
 import { computed } from 'vue'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseMotionIcon from '@/components/base/BaseMotionIcon.vue'
 
-const props = defineProps<{
-  summary: Awaited<ReturnType<typeof getUsageRecordSummary>>
-}>()
+const props = withDefaults(defineProps<{
+  summary?: Awaited<ReturnType<typeof getUsageRecordSummary>>
+  userSummary?: UserUsageSummary | null
+}>(), {
+  summary: undefined,
+  userSummary: null,
+})
 
 function averageLatencyDisplay(value: string) {
   return !value || value === '—' || value === '-' ? '0 ms' : value
@@ -19,23 +23,23 @@ const items = computed(() => [
     key: 'requests',
     label: '成功请求',
     icon: Activity,
-    value: props.summary.totalRequests,
-    detail: '筛选范围内',
+    value: props.userSummary ? String(props.userSummary.requestCount) : props.summary?.totalRequests ?? '0',
+    detail: props.userSummary ? `成功 ${props.userSummary.successCount} · 未成功 ${props.userSummary.failureCount}` : '筛选范围内',
     tone: 'bg-cp-blue-container text-cp-blue-on-container',
   },
   {
     key: 'tokens',
     label: '总 Token',
     icon: FileText,
-    value: props.summary.totalTokens,
-    detail: `输入 ${props.summary.inputTokens} / 输出 ${props.summary.outputTokens}`,
+    value: props.userSummary ? String(props.userSummary.totalTokens) : props.summary?.totalTokens ?? '0',
+    detail: props.userSummary ? `输入 ${props.userSummary.inputTokens} / 输出 ${props.userSummary.outputTokens}` : `输入 ${props.summary?.inputTokens ?? '0'} / 输出 ${props.summary?.outputTokens ?? '0'}`,
     tone: 'bg-cp-green-container text-cp-green-on-container',
   },
   {
     key: 'cached',
     label: '缓存 Token',
     icon: Database,
-    value: props.summary.cachedTokens,
+    value: props.userSummary ? String(props.userSummary.cachedTokens) : props.summary?.cachedTokens ?? '0',
     detail: '缓存读取命中',
     tone: 'bg-cp-orange-container text-cp-orange-on-container',
   },
@@ -43,7 +47,7 @@ const items = computed(() => [
     key: 'latency',
     label: '平均耗时',
     icon: Timer,
-    value: averageLatencyDisplay(props.summary.averageLatencyMs),
+    value: props.userSummary ? `${props.userSummary.averageLatencyMs ?? 0} ms` : averageLatencyDisplay(props.summary?.averageLatencyMs ?? '0 ms'),
     detail: '成功请求平均值',
     tone: 'bg-cp-cyan-container text-cp-cyan-on-container',
   },
@@ -63,10 +67,10 @@ const items = computed(() => [
         <component :is="item.icon" class="size-4.5" />
       </BaseMotionIcon>
       <div class="flex min-w-0 flex-col justify-between py-0.5">
-        <span class="block text-cp-sm leading-none font-bold text-cp-text-quaternary">
+        <span class="block text-cp-sm leading-none font-emphasis text-cp-text-quaternary">
           {{ item.label }}
         </span>
-        <strong class="block truncate text-[22px] leading-none font-extrabold text-cp-text">
+        <strong class="block truncate text-cp-xl leading-none font-heavy text-cp-text">
           {{ item.value }}
         </strong>
         <span class="block truncate text-cp-sm leading-none font-emphasis text-cp-text-secondary">

@@ -24,10 +24,19 @@ export * from './modules/proxies'
 // 设置管理
 export * from './modules/settings'
 
+// 套餐与订阅管理
+export * from './modules/subscriptions'
+
 // 系统更新
 export * from './modules/system'
 
 // 使用记录
 export * from './modules/usage'
+
+// 普通用户自助能力
+export * from './modules/user'
+
+// 用户管理
+export * from './modules/users'
 
 export type { RequestLocation } from './types/request-location'

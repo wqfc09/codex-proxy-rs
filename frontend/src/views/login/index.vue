@@ -1,55 +1,86 @@
 <script setup lang="ts">
-import { computed, shallowRef } from 'vue'
+import type { PublicAuthConfig } from '@/api'
+
+import { storeToRefs } from 'pinia'
+import { computed, onMounted, ref, shallowRef } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
+import { getPublicAuthConfig } from '@/api'
 import { useAuthStore } from '@/stores/modules/auth'
+import { useThemeStore } from '@/stores/modules/theme'
 
 import LoginBackground from './components/LoginBackground.vue'
 import LoginPanel from './components/LoginPanel.vue'
 import LoginThemeToggle from './components/LoginThemeToggle.vue'
-
-type LoginRealm = 'admin' | 'key'
+import LoginTurnstile from './components/LoginTurnstile.vue'
 
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
+const themeStore = useThemeStore()
+const { effectiveTheme } = storeToRefs(themeStore)
 
-const realm = shallowRef<LoginRealm>(normalizeRealm(window.history.state?.loginMode))
 const username = shallowRef('')
 const password = shallowRef('')
-const apiKey = shallowRef('')
 const loginPending = shallowRef(false)
+const authConfig = shallowRef<PublicAuthConfig | null>(null)
+const authConfigLoading = shallowRef(true)
+const authConfigError = shallowRef('')
+const turnstileToken = shallowRef('')
+const turnstileRef = ref<InstanceType<typeof LoginTurnstile> | null>(null)
 
-const canSubmit = computed(() => realm.value === 'key'
-  ? Boolean(apiKey.value.trim())
-  : Boolean(username.value.trim() && password.value))
+const canSubmit = computed(() => Boolean(username.value.trim() && password.value))
 const loginLoading = computed(() => authStore.loading || loginPending.value)
-const submitDisabled = computed(() => loginLoading.value || !canSubmit.value)
+const turnstileRequired = computed(() => authConfig.value?.turnstileEnabled === true)
+const turnstileConfigured = computed(() => !turnstileRequired.value || Boolean(authConfig.value?.turnstileSiteKey))
+const turnstileReady = computed(() => !turnstileRequired.value || Boolean(turnstileToken.value))
+const showProtectionSlot = computed(() => authConfigLoading.value || Boolean(authConfigError.value) || turnstileRequired.value)
+const submitDisabled = computed(() =>
+  loginLoading.value
+  || !canSubmit.value
+  || authConfigLoading.value
+  || Boolean(authConfigError.value)
+  || !turnstileConfigured.value
+  || !turnstileReady.value,
+)
+
+async function loadAuthConfig() {
+  authConfigLoading.value = true
+  authConfigError.value = ''
+  try {
+    authConfig.value = await getPublicAuthConfig({ silent: true })
+  }
+  catch {
+    authConfig.value = null
+    authConfigError.value = '登录保护配置加载失败，请刷新页面后重试'
+  }
+  finally {
+    authConfigLoading.value = false
+  }
+}
+
+onMounted(loadAuthConfig)
 
 async function handleSubmit(): Promise<void> {
-  if (!canSubmit.value || loginPending.value)
+  if (submitDisabled.value || loginPending.value)
     return
 
   loginPending.value = true
-  const selectedRealm = realm.value
-  const result = await authStore.login(selectedRealm === 'key'
-    ? { mode: 'key', apiKey: apiKey.value.trim() }
-    : {
-        mode: 'admin',
-        username: username.value.trim(),
-        password: password.value,
-      })
+  const result = await authStore.login({
+    username: username.value.trim(),
+    password: password.value,
+    turnstileToken: turnstileRequired.value ? turnstileToken.value : undefined,
+  })
 
   if (!result) {
+    if (turnstileRequired.value)
+      turnstileRef.value?.reset()
     loginPending.value = false
     return
   }
 
   try {
-    if (result.role === 'admin')
-      await router.push(resolveDestination())
-    else
-      await router.push('/key-usage')
+    await router.push(resolveDestination() ?? authStore.defaultRoute)
   }
   finally {
     if (router.currentRoute.value.path === '/login')
@@ -57,14 +88,10 @@ async function handleSubmit(): Promise<void> {
   }
 }
 
-function normalizeRealm(value: unknown): LoginRealm {
-  return value === 'key' ? 'key' : 'admin'
-}
-
-function resolveDestination(): string {
+function resolveDestination(): string | null {
   const requested = route.query.redirect
   if (typeof requested !== 'string' || !requested.startsWith('/') || requested.startsWith('//'))
-    return '/'
+    return null
   return requested
 }
 </script>
@@ -83,14 +110,32 @@ function resolveDestination(): string {
     >
       <div class="min-h-120 w-[min(440px,100%)]">
         <LoginPanel
-          v-model:realm="realm"
           v-model:username="username"
           v-model:password="password"
-          v-model:api-key="apiKey"
           :loading="loginLoading"
           :submit-disabled="submitDisabled"
           @submit="handleSubmit"
-        />
+        >
+          <template #protection>
+            <div v-if="showProtectionSlot" class="grid min-h-24 min-w-0 content-start" aria-live="polite">
+              <LoginTurnstile
+                v-if="turnstileRequired"
+                ref="turnstileRef"
+                v-model="turnstileToken"
+                :enabled="turnstileRequired"
+                :site-key="authConfig?.turnstileSiteKey ?? null"
+                :theme="effectiveTheme"
+              />
+              <p
+                v-else
+                class="m-0 text-cp-sm font-emphasis"
+                :class="authConfigError ? 'text-cp-error-text' : 'text-(--cp-login-description-color)'"
+              >
+                {{ authConfigError || '正在加载登录保护配置…' }}
+              </p>
+            </div>
+          </template>
+        </LoginPanel>
       </div>
     </section>
   </main>

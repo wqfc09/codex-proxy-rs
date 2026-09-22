@@ -1,25 +1,16 @@
 <script setup lang="ts">
 import type { ApiKeyFormValue } from '../composables/useApiKeyMutations'
-import type { AccountGroup } from '@/api'
-import { Openai, Xai } from '@boxicons/vue'
 import { Copy, DollarSign, KeyRound, Upload } from '@lucide/vue'
-import { computed, shallowRef } from 'vue'
+import { computed } from 'vue'
 
-import AccountGroupCheckboxGrid from '@/components/AccountGroupCheckboxGrid.vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
 import BaseForm from '@/components/base/BaseForm/index.vue'
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
 import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import ClientProfileEditor from '@/components/client-profile/ClientProfileEditor.vue'
-import XaiClientProfileEditor from '@/components/client-profile/XaiClientProfileEditor.vue'
-import { PROVIDER_DISPLAY_NAMES } from '@/utils/providers'
 
 const props = defineProps<{
-  groups: AccountGroup[]
-  groupLoading: boolean
   editing: boolean
   createdKey: string
   saving: boolean
@@ -33,18 +24,13 @@ const open = defineModel<boolean>({ default: false })
 const createdOpen = defineModel<boolean>('createdOpen', { default: false })
 const form = defineModel<ApiKeyFormValue>('form', { required: true })
 const title = computed(() => props.editing ? '编辑密钥' : '创建 API Key')
-const profileProvider = shallowRef('openai')
-const profileProviderOptions = [
-  { label: PROVIDER_DISPLAY_NAMES.openai, value: 'openai', icon: Openai },
-  { label: PROVIDER_DISPLAY_NAMES.xai, value: 'xai', icon: Xai },
-]
 </script>
 
 <template>
   <BaseModal
     v-model="open"
     :title="title"
-    description="配置密钥信息、分组与使用限制"
+    description="配置密钥信息与使用限制；上游权限由管理员统一管理"
     tone="info"
     size="lg"
     :dismissible="!saving"
@@ -85,56 +71,6 @@ const profileProviderOptions = [
           placeholder="留空自动生成"
           :disabled="saving"
         />
-      </BaseFormItem>
-
-      <BaseFormItem label="分组">
-        <AccountGroupCheckboxGrid
-          v-model="form.groupIds"
-          :groups="groups"
-          :loading="groupLoading"
-          :disabled="saving"
-        />
-      </BaseFormItem>
-
-      <BaseFormItem label="上游身份">
-        <ClientProfileEditor
-          v-if="open"
-          v-show="profileProvider === 'openai'"
-          v-model="form.openaiClientProfileOverride"
-          allow-inherit
-          :active="profileProvider === 'openai'"
-          :disabled="saving"
-        >
-          <template #source-extra>
-            <BaseSegmented
-              v-model="profileProvider"
-              label="上游身份平台"
-              class="w-20 shrink-0"
-              display="icon"
-              :options="profileProviderOptions"
-              :disabled="saving"
-            />
-          </template>
-        </ClientProfileEditor>
-        <XaiClientProfileEditor
-          v-if="open"
-          v-show="profileProvider === 'xai'"
-          v-model="form.xaiClientProfileOverride"
-          allow-inherit
-          :active="profileProvider === 'xai'"
-          :disabled="saving"
-        >
-          <template #source-extra>
-            <BaseSegmented
-              v-model="profileProvider"
-              label="上游身份平台"
-              class="w-20 shrink-0"
-              display="icon"
-              :options="profileProviderOptions"
-              :disabled="saving"
-            />
-          </template>
-        </XaiClientProfileEditor>
       </BaseFormItem>
 
       <div class="grid gap-6 sm:grid-cols-2">
@@ -220,12 +156,12 @@ const profileProviderOptions = [
   >
     <div class="flex flex-col gap-4">
       <div class="rounded-cp border border-cp-warning-border bg-cp-warning-container px-4 py-3">
-        <p class="m-0 text-cp font-semibold text-cp-warning-on-container">
+        <p class="m-0 text-cp font-emphasis text-cp-warning-on-container">
           该密钥具有网关访问权限，请仅发送给可信调用方
         </p>
       </div>
       <div>
-        <p class="mb-2 text-cp font-medium text-cp-text-secondary">
+        <p class="mb-2 text-cp font-emphasis text-cp-text-secondary">
           API Key
         </p>
         <div class="flex items-center gap-2">
