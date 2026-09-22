@@ -305,8 +305,7 @@ OpenAI 选号阶段确认本次可选账号全部额度耗尽时，HTTP 返回 `
 ### API Key 额度查询
 
 `GET /v1/usage` 使用 `Authorization: Bearer <Client Key>`，不接受会话 Cookie、管理 API Key 或查询参数。
-只返回该 Key 的日与周额度，不包含明文 Key、账号资料或其他 Key 的数据。查询不会调用上游、扣费、占用推理并发/RPM，
-也不会更新最近使用时间或开启预算窗口；额度耗尽后仍可查询。
+查询不会调用上游、扣费、占用推理并发/RPM，也不会更新最近使用时间或开启预算窗口；额度耗尽后仍可查询。
 
 成功响应直接返回以下 JSON，不使用管理接口信封，所有响应带 `Cache-Control: no-store`：
 
@@ -314,60 +313,65 @@ OpenAI 选号阶段确认本次可选账号全部额度耗尽时，HTTP 返回 `
 {
   "unit": "USD",
   "daily": { "total": "1", "used": "0.640001", "remaining": "0.359999", "resetsAt": "2026-09-21T16:00:00Z" },
-  "weekly": { "total": "5", "used": "2.35", "remaining": "2.65", "resetsAt": "2026-09-27T16:00:00Z" }
+  "weekly": { "total": "5", "used": "2.35", "remaining": "2.65", "resetsAt": "2026-09-27T16:00:00Z" },
+  "available": { "remaining": "0.359999", "resetsAt": "2026-09-21T16:00:00Z" }
 }
 ```
 
-金额使用十进制字符串，`total` 为当前周期限额，`used` 为该周期已结算金额，`remaining` 为限额减已用且最低为零。
-不限额时 `total`、`remaining` 均为 `null`，仍返回已用金额。`resetsAt` 为 RFC3339 时间，尚未开启或已到期的窗口返回 `null`，
-已到期窗口的 `used` 为 `"0"`。日窗口按北京时间零点划分，周窗口沿用首次使用起的七天周期，不固定为周一。
-修改限额、管理员重置和费用结算均复用现有 Key 账本，不从请求日志重算余额。
+`daily` 和 `weekly` 保留当前 Key 自身账本的 v3.13 合同。金额使用十进制字符串；`total` 为 Key 周期限额，
+`used` 为该 Key 已结算金额，`remaining` 为限额减已用且最低为零。Key 不限额时 `total`、`remaining` 为 `null`。
+Key 日窗口按北京时间零点划分，Key 周窗口沿用滚动七日周期，不固定为周一。
+
+`available.remaining` 是这把 Key 此刻真正还能消费的 USD 上限：对 User-owned Key，取 Key 日/周二级限额与
+User 当前套餐日/自然周/月有效额度（含当前窗口 credit）各自剩余额度中的最小有限值；ownerless Key 只受自身日/周限额。
+无限窗口不参与最小值，全部窗口都无限时返回 `null`。`available.resetsAt` 对应该最紧约束的当前重置时间；
+并列约束采用不早于任一并列窗口的时间。该投影复用现有 Key/User 账本，不从请求日志重算余额。
 
 缺失、非法、已禁用或已删除的 Key 返回 OpenAI 风格 `401` 错误；未知查询参数返回 `400 invalid_usage_query`，
 读取账本失败返回 `503 usage_unavailable`，不会用零余额掩盖故障。
 
 ## 4. 浏览器认证
 
-### 统一登录与会话
+### Account/User 统一登录与会话
 
-管理员和密钥登录共用 `/api/auth/*`。登录模式 `mode` 只用于选择凭据验证方式，不直接授予权限；
-验证成功后，由后端写入身份和绑定 ID。一个浏览器只持有一份 `cpr_session` HttpOnly Cookie，
-原始 Key 不进入 URL、Pinia 或浏览器存储。登录页的切换只改变本地表单，不改变 URL。
-管理员进入管理端；Key 登录后进入 `/key-usage`，只读取当前会话绑定 Key 的数据。
+浏览器身份统一为 Account/User。管理员和普通 User 都通过 `/api/auth/login` 提交账号密码，
+服务端按 User 的 canonical role 建立 `admin` 或 `user` 会话；API Key 不作为浏览器登录凭据。
+一个浏览器只持有一份 `cpr_session` HttpOnly Cookie，角色不接受客户端声明。
 
 | 方法 | 路由 | 请求 | 说明 |
 | --- | --- | --- | --- |
-| `POST` | `/api/auth/login` | `{ mode: "admin", username?, password }` 或 `{ mode: "key", apiKey }` | 验证凭据、创建会话；成功后撤销请求携带的旧会话 |
-| `GET` | `/api/auth/status` | 无 | 从 Cookie 恢复服务端身份，返回 `{ authenticated, session }` |
+| `GET` | `/api/auth/config` | 无 | 返回 Turnstile 是否启用及公开 site key |
+| `POST` | `/api/auth/login` | `{ username, password, turnstileToken? }` | 验证 User 凭据并创建会话；成功后撤销请求携带的旧会话 |
+| `GET` | `/api/auth/status` | 无 | 从 Cookie 恢复 Account/User 身份，返回 `{ authenticated, session }` |
 | `POST` | `/api/auth/logout` | 无 | 删除当前会话并清除 Cookie；存储失败返回 503，不假装退出成功 |
-| `POST` | `/api/auth/password` | `{ currentPassword, newPassword }` | 仅管理员会话可用；验证当前密码后修改密码，撤销全部管理员会话并清除当前 Cookie |
+| `POST` | `/api/auth/password` | `{ currentPassword, newPassword }` | 管理员兼容入口；修改成功后清除当前 Cookie 并要求重新登录 |
 
-登录返回 `data: { role: "admin" | "key", expiresAt }`；status 已登录时的 `session` 使用同一结构，
-未登录时为 `{ authenticated: false, session: null }`。`role` 由服务端已验证身份推导，不接受客户端声明。
-不返回凭据或绑定 ID。
+登录返回 `data: { role: "admin" | "user", expiresAt }`；status 已登录时的 `session` 使用同一结构，
+未登录时为 `{ authenticated: false, session: null }`。管理员可以访问管理工作区和 User workspace，
+普通 User 只能访问 User workspace；后端路由仍各自执行权限校验，前端路由守卫不是安全边界。
 
-修改密码要求新密码至少 12 个字符、最多 1024 字节，不能包含控制字符、使用常见弱口令或与当前密码相同。
-成功返回 `{ message }`，需要重新登录；当前密码错误或新密码不合法返回 400，并保留原会话。
-并发修改中只有旧密码哈希仍匹配的请求可以提交，冲突返回 409；密码更新与安全审计在同一事务提交。
-该入口共用登录尝试限流，超限返回 429。普通设置变更和管理员 API Key 变更不撤销密码登录会话，密钥身份会话也不受改密影响。
+Turnstile 启用时，登录请求必须携带有效 `turnstileToken`；site key 可通过 `/api/auth/config` 公开读取，
+secret 只保存在服务端。登录尝试共享来源桶和全局桶，分别为每 60 秒 10 次 / 200 次；来源取连接 IP，
+不信任任意转发头。拒绝时使用 `42901` 和 `Retry-After`。
 
-会话由服务端保存，Cookie 属性为 `Path=/; HttpOnly; SameSite=Lax`，`Max-Age` /
-`Expires` 对齐固定有效期，`Secure` 沿用上述 Origin 规则。轮询不会续期。
-管理员有效期由 `admin.session_ttl_minutes` 控制；密钥有效期由 `client.session_ttl_minutes` 控制，默认 1440 分钟。
+会话由服务端保存，Cookie 属性为 `Path=/; HttpOnly; SameSite=Lax`，`Max-Age` / `Expires`
+对齐固定有效期，`Secure` 沿用 Origin 规则。管理员和普通 User 的 TTL 可由管理端分别配置，轮询不会续期。
+密码哈希或 `session_version` 变化后旧会话失效；角色修改、管理员重置密码和显式撤销会话都依赖该服务端事实，
+不会让现有 Cookie 热切换到新权限。
 
-每次恢复密钥会话时重新确认 Key 存在且启用；停用或删除后会话失效，重新启用不会恢复已撤销会话。
-依赖不可用时返回 503，不返回已认证或假装未登录。预算耗尽不妨碍登录。
-
-密钥会话访问管理接口返回 403，不清除仍然有效的会话。
-浏览器会话不能替代 `/v1/*` 的 Bearer Key，数据面 Key 也不能替代浏览器会话。
+User 自助改名和改密使用 `/api/user/profile`、`/api/user/password`，均要求当前密码。
+自助改密保留发起操作的当前会话并撤销其他会话；管理员兼容的 `/api/auth/password` 修改成功后要求重新登录。
+浏览器会话不能替代 `/v1/*` 的 Bearer Key，数据面 Key 也不能替代 Account/User 浏览器会话。
 
 所有 `/api/auth/*` 响应带 `Cache-Control: no-store`；未知路径和错误 method 返回 JSON，不落入 SPA。
-两种登录共享来源桶和全局桶，分别为每 60 秒 10 次 / 200 次；来源取连接 IP，不信任任意转发头。
-拒绝时使用 `42901` 和 `Retry-After`。
-
 认证错误共用 `40101`（会话失效）、`40102`（凭据错误）和 `40301`（权限不足）。
 前端只在明确的会话失效时统一退出，不按 URL 或每个接口上的身份标记分发。
 
+### Legacy Key session 兼容接口
+
+后端仍保留 `/api/key-usage/*` 对已存在服务端 Key session 的读取能力，用于平滑处理升级前尚未过期的会话。
+当前 `/api/auth/login` 不接受 API Key，前端也不提供 `/key-usage` 路由；新的客户端接入应使用 User workspace
+管理 Key，并使用 Bearer `/v1/usage` 查询额度。以下接口不接受 Bearer Key 或管理 API Key。
 ### Key 用量与客户端配置
 
 以下接口仅接受 Key 身份的 `cpr_session`，不接受 Bearer Key 或管理 API Key。管理员会话返回 `40301`；
@@ -925,95 +929,98 @@ HTTP 请求头及新建 WS 的握手提示按当时的最终出站档位构造�
 | `POST` | `/api/admin/account-groups/update` | `{ id, name, description, color, disableFast? }` | 更新名称、描述、颜色和 Fast 限制 |
 | `POST` | `/api/admin/account-groups/enable` | `{ id }` | 启用 |
 | `POST` | `/api/admin/account-groups/disable` | `{ id }` | 禁用；已绑定 Key 保持受限，不回退到全部账号 |
-| `POST` | `/api/admin/account-groups/delete` | `{ id }` | 删除未被 Client Key 引用的组 |
+| `POST` | `/api/admin/account-groups/delete` | `{ id }` | 仅删除未被 User 或 legacy 直绑 Client Key 引用的组 |
 
 列表数据为 `{ items, page, configRevision }`，其中 item 返回 `memberCount`、按 Provider 聚合的
-`providerCounts` 和 `clientKeyCount`。查询分组成员使用账号列表的 `groupId` 筛选，
+`providerCounts`、`userCount` 和 `clientKeyCount`；`userCount` 表示当前 User 分配引用，`clientKeyCount` 仅表示 legacy Key 的直接分组引用。查询分组成员使用账号列表的 `groupId` 筛选，
 不提供独立的分组成员路由；账号的 Provider 不代表整个分组的 Provider。
 
-## 7. Client Key
+## 7. User 账户、套餐与 Client Key
+
+### User 自助接口
+
+Admin 和普通 User 都可使用自己的 User workspace；所有 `/api/user/*` 都从当前 Account/User session 确定范围，
+不接受调用方指定其他 User ID。
+
+| 方法 | 路由 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/user/me` | 当前 User 的账号、角色和并发/RPM |
+| `POST` | `/api/user/profile` | 验证当前密码后修改自己的 username |
+| `POST` | `/api/user/password` | 验证当前密码后修改自己的密码，保留当前会话并撤销其他会话 |
+| `GET` | `/api/user/billing` | 当前套餐、有效订阅、倍率、日/周/月额度及安全分组摘要 |
+| `GET` | `/api/user/billing/subscriptions` | 分页读取自己的订阅历史 |
+| `GET` | `/api/user/groups` | 读取自己的账号分组摘要 |
+| `GET` | `/api/user/usage/summary` | 当前 User 在时间范围内的安全用量汇总、趋势和分布 |
+| `GET` | `/api/user/usage/records` | 分页读取自己的请求记录 |
+| `GET` | `/api/user/usage/records/detail` | 读取自己的单条安全请求详情 |
+
+User Usage 只返回 User 自己的持久化事实，不暴露 Provider Account、代理、凭据、attempt/trace 或上游请求标识。
+历史记录保存 username、Key 名称和计费快照，不依赖当前关联行解释历史事实。
+
+### Admin User 与套餐控制面
+
+`/api/admin/users/*` 和 `/api/admin/subscription-plans/*` 仅接受管理员身份或现有部署级管理认证。
+User 的并发/RPM 属于账户限制；Plan 只拥有日/周/月金额额度；Subscription 只绑定 Plan、有效期和 downstream multiplier。
+
+主要路由包括：
+
+- `/api/admin/users`、`create`、`update`、`reset-password`、`revoke-sessions`、`delete`
+- `/api/admin/users/key-identity`、`key-identity/update`、`key-identity/key/update`
+- `/api/admin/subscription-plans` 及 `create`、`update`、`enable`、`disable`
+- `/api/admin/users/billing`、`subscription/grant`、`subscription/update`、`subscription/renew`、`subscription/revoke`
+- `/api/admin/users/subscription-history`、`groups`、`groups/update`、`billing/topups`、`billing/topups/create`、`billing/reset`
+
+最后一个 enabled Admin 不能被停用、删除或降级。角色变化和管理员安全操作推进 User session version，
+旧会话不会在原 Cookie 上获得新权限。没有有效显式订阅时使用启用的 Base Plan，倍率为 `1`。
+
+### Client Key
+
+Client Key 产品控制面只存在于 User workspace；管理员本身也是 User，需要管理自己的 Key 时同样使用 `/api/user/client-keys/*`。
+旧的 `/api/admin/client-keys/*` 已删除并返回 `404`，不会重定向或继续创建 ownerless Key。历史 ownerless Key 仅保留运行时兼容，不提供新的 Admin CRUD 入口。
 
 | 方法 | 路由 | 主要 query/body | 说明 |
 | --- | --- | --- | --- |
-| `GET` | `/api/admin/client-keys` | `cursor`、`limit`、`search`、`sortBy`、`sortDirection` | 游标分页查询 |
-| `POST` | `/api/admin/client-keys/create` | 创建字段 | 创建带账号范围的 Client Key |
-| `GET` | `/api/admin/client-keys/reveal` | `id` | 显式读取完整明文 Key |
-| `POST` | `/api/admin/client-keys/update` | 更新字段 | 原子更新名称、分组范围和限额 |
-| `POST` | `/api/admin/client-keys/reset-budget` | `{ id, period }` | 管理员清零日／周已用金额；`period` 为 `daily`、`weekly` 或 `all` |
-| `POST` | `/api/admin/client-keys/enable` | `{ id }` | 启用 |
-| `POST` | `/api/admin/client-keys/disable` | `{ id }` | 禁用 |
-| `POST` | `/api/admin/client-keys/delete` | `{ id }` | 删除 |
+| `GET` | `/api/user/client-keys` | `cursor`、`limit`、`search`、`sortBy`、`sortDirection` | 只查询当前登录 User 拥有的 Key |
+| `POST` | `/api/user/client-keys/create` | 创建字段 | 为当前 User 创建 Key |
+| `GET` | `/api/user/client-keys/reveal` | `id` | 仅 owner 可显式读取完整明文 Key |
+| `POST` | `/api/user/client-keys/update` | 更新字段 | 仅修改当前 User Key 的名称、标签与二级限额 |
+| `POST` | `/api/user/client-keys/reset-budget` | `{ id, period }` | 清零当前 User Key 所选日／周窗口；`period` 为 `daily`、`weekly` 或 `all` |
+| `POST` | `/api/user/client-keys/enable` | `{ id }` | 启用当前 User Key |
+| `POST` | `/api/user/client-keys/disable` | `{ id }` | 禁用当前 User Key |
+| `POST` | `/api/user/client-keys/delete` | `{ id }` | 删除当前 User Key |
 
-创建字段为 `name`、可选 `label`、`groupIds`、`maxConcurrency`、`requestsPerMinute`、可选
-`dailyLimitUsd`、`weeklyLimitUsd`、`customKey`、`openaiClientProfileOverride` 和 `xaiClientProfileOverride`。更新请求携带 `id`，不接受 `customKey`。
-`groupIds` 必须显式提交：空数组派生 `routingScope: "all"`，非空数组派生
-`routingScope: "groups"`。响应同时返回分组引用 `groups`，以及从当前有效账号池派生、仅供展示的
-`providerKinds`。创建和 reveal 响应会返回完整明文 Key，调用方
-必须立即安全保存。
+创建字段为 `name`、可选 `label`、可选 `customKey`、`maxConcurrency`、`requestsPerMinute`、
+可选 `dailyLimitUsd` 和 `weeklyLimitUsd`。更新请求额外携带 `id`，不接受 `customKey`。
+User API 使用 `deny_unknown_fields`，不接受 `groupIds`、`openaiClientProfileOverride` 或
+`xaiClientProfileOverride`。
 
-`openaiClientProfileOverride` 为完整的 [OpenAI 客户端身份](#openai-上游客户端身份)对象或 `null`，列表也返回该字段。
-`xaiClientProfileOverride` 对应完整的 [xAI 客户端身份](#xai-上游客户端身份)，两者分别覆盖所属 Provider，列表同时返回。
-创建时省略或 `null` 表示跟随通用设置；更新时省略保留现值，显式 `null` 才清除覆盖。
-独立配置整体覆盖通用设置，不逐字段继承；切换全局配置不会影响独立 Key。
+User-owned Key 的路由范围始终来自 User 的 Account Groups；上游身份默认继承 User，可由管理员按 Provider 对单把 Key 设置 override：
 
-密钥列表的 `search` 仅匹配名称和标签，不匹配密钥值或可见前缀；搜索不区分大小写，使用字面量前缀匹配。
-创建和更新时去除名称首尾空白，并按忽略大小写、首尾空格的名称查重，重复返回 `409`。
-更新排除当前记录，并发写入同样执行查重；失败不会留下审计或配置版本变更。
-历史重名数据不自动改名，已有凭据继续有效；再次保存时需使用未被其他密钥占用的名称。
-
-`customKey` 仅用于创建：省略、`null` 或空字符串时继续自动生成；非空时按原值保存，不追加前缀、
-不截断、不修剪空白，也不要求固定长度。Key 须为 HTTP Bearer 可传输的非空可见 ASCII 字符，
-支持标点，空格、控制字符和非 ASCII 文本会返回 `400`。重复 Key 返回 `409`，包括并发创建时。
-应用不另设 Key 长度上限；创建请求和 `Authorization` 头仍受 Web 服务器及反向代理的通用大小限制。
-更新接口不接受 `customKey`，防止修改策略时意外替换正在使用的凭据。
-列表仅展示最多前 10 个字符，且至少隐藏一半字符；单字符 Key 的可见前缀为空。
-完整值仍只通过创建和显式 reveal 返回，不进入普通 Debug 或审计。
-
-自定义 Key 创建示例：
-
-```json
-{
-  "name": "迁入的客户端",
-  "customKey": "legacy-platform-key/example+=",
-  "groupIds": [],
-  "maxConcurrency": 2,
-  "requestsPerMinute": 0
-}
+```text
+User
+├─ Account Groups
+├─ OpenAI / xAI default request identity
+└─ owned Client Keys
+   ├─ name / label / secret / Key-level limits
+   └─ optional OpenAI / xAI identity override
 ```
 
-自定义 Key 的分组权限、日／周限额和并发规则按本平台配置执行，不导入其他平台的历史用量。
+普通 User 不能通过自己的 Key CRUD 扩大分组或写入 provider identity；这些字段不在 User Key 可写合同中。
+管理员可在 User Account 管理中修改 User 默认身份，也可为某把 owned Key 设置或清除 Provider override。
+运行时按 Provider 先取 Key override，缺失时继承 User 默认身份；Group 始终只继承 User。
 
-金额字段为非负十进制字符串，最多 10 位整数与 10 位小数，`"0"` 表示不限额。
-创建时省略金额字段默认为零；更新时省略或 `null` 保留当前值，修改限额不会清空已用金额。
-`maxConcurrency` 和 `requestsPerMinute` 是非负整数，零表示不限。
+创建和 reveal 响应会一次性返回完整明文 Key，并设置 `Cache-Control: no-store`；调用方必须立即安全保存。
+普通列表只返回安全前缀。前端创建成功流程展示复制和 CCSwitch 导入提示，关闭成功弹窗后清理明文状态。
 
-列表返回 `dailyLimitUsd`、`weeklyLimitUsd`、`dailyUsedUsd`、`weeklyUsedUsd`（均为字符串）、
-`dailyResetsAt`、`weeklyResetsAt`（RFC3339 或 `null`）。
-记账和限额比较保留完整精度。
-日窗口按北京时间零点重置；周窗口从首次准入当天零点起持续七天，到期后在下一次使用时重新开启。
-手动重置仅清零所选周期的已用金额，保留限额上限、原到期时间和历史费用，返回 `{ id }`。
-未使用或已过期的窗口不会因手动重置而重新开启。重置前完成但延迟结算的费用不再计入所选周期；
-重置后完成的请求继续计费，包括重置时仍在进行的请求。操作保留管理员审计，不改变账号上游额度。
-费用按请求完成时间归属窗口。并发按同一 Key 的执行中请求累计，包含 SSE 与每个 WebSocket
-`response.create`；空闲连接不占名额，内部重试不重复占用。
-修改 Key 策略对既有 WebSocket 连接的下一次请求同样生效，已开始的请求保持原有快照。
+`customKey` 仅用于创建：省略、`null` 或空字符串时自动生成；非空时按原值保存，不追加前缀。
+Key 必须是 HTTP Bearer 可传输的非空可见 ASCII；重复 Key 返回 `409`。更新接口不能更换凭据。
 
-运行设置可以分别启用 Key 与账号的有界排队。Key 并发满时按 Key 等待；账号先使用其它可调度候选，
-适用账号均暂时满载后按账号等待。RPM、金额限额、失效账号和上游冷却不通过排队绕过。
-队列满返回 `429` / `concurrency_queue_full`，排队超时返回 `429` / `concurrency_queue_timeout`；
-WebSocket 使用对应错误事件。等待期间不发送上游请求，取消后释放等待位置，排队重查不重复计入 RPM。
-SSE 在取得有效执行前不发送保活帧，因此此阶段保留 HTTP 错误状态；已开始交付的失败沿用流内错误合同。
+Key 自身的 `maxConcurrency=0`、`requestsPerMinute=0` 表示不增加 Key 级限制；它们仍受 User 级限制约束。
+User 限制语义不同：`null` 表示不限、`0` 表示拒绝。金额字段 `"0"` 表示该 Key 不增加金额上限。
+日窗口按北京时间零点；Key 周窗口保持上游滚动七日语义。User 套餐周额度则是独立的北京时间自然周。
 
-任一已结算金额达到限额后拒绝新请求，已准入请求可完成并使金额超过阈值。
-HTTP 返回 `429`，`error.code` 为 `key_daily_budget_exceeded` 或 `key_weekly_budget_exceeded`，
-并附 `Retry-After`；WebSocket 每次 `response.create` 执行相同检查并返回协议错误事件。
-只累计上游上报或按用量与模型价格计算出的 USD 费用；无法取得费用的尝试按零累计，
-保留错误和用量诊断，不产生待核账记录或阻断。内部重试中已经取得的费用仍会累计。
-预算存储不可用时返回 `503`、`key_budget_unavailable`。
-
-自动结算按网关请求 ID 幂等执行。账本独立于使用统计日志，记录保留至删除 Key，
-不受 `usageRetentionDays` 影响。
-
+任一 Key 已结算金额达到限额后拒绝新请求；已准入请求允许完成。只有已知 USD 费用参与金额累计，未知费用保持未知，
+不会伪造零费用。并发、RPM、User 共享准入和 Key 准入共同生效。
 ## 8. 运行设置
 
 | 方法 | 路由 | 说明 |
